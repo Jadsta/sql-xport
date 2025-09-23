@@ -20,6 +20,30 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
+def parse_duration(s):
+    """
+    Converts a duration string like '500ms', '10s', '5m', or '2h' into seconds (float).
+    """
+    units = {
+        'ms': 0.001,
+        's': 1,
+        'm': 60,
+        'h': 3600
+    }
+
+    s = s.strip().lower()
+    for unit, factor in units.items():
+        if s.endswith(unit):
+            try:
+                return float(s[:-len(unit)]) * factor
+            except ValueError:
+                raise ValueError(f"Invalid numeric value in duration: {s}")
+    # Default fallback: assume it's raw seconds
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"Unrecognized duration format: {s}")
+
 def load_sql_exporter_config(exporter_name):
     config_path = Path(f"./{exporter_name}/sql_exporter.yml")
     logging.info(f"Loading config from: {config_path}")
@@ -82,6 +106,15 @@ def resolve_queries_from_metrics(collector):
     return resolved
     
 def format_value(val):
+    """
+    Formats a value for Prometheus output:
+    - datetime → scientific notation timestamp
+    - zero → "0"
+    - very large/small floats → scientific notation
+    - regular numbers → clean decimal format
+    """
+    import datetime
+
     if isinstance(val, datetime.datetime):
         return f"{val.timestamp():.9e}"
 
@@ -103,65 +136,99 @@ def load_queries_from_collectors(matched_collectors):
         logging.info(f"Loading collector: {name}")
         queries.extend(resolve_queries_from_metrics(collector))
     return queries
+    
+class PooledConnection:
+    def __init__(self, conn):
+        self.conn = conn
+        self.created_at = time.time()
 
-def run_queries(dsn_dict, queries):
-    logging.info("Connecting to Teradata with DSN")
-    logging.debug(f"DSN dict: {dsn_dict}")
-    conn = teradatasql.connect(**dsn_dict)
-    cursor = conn.cursor()
-    metrics = []
-
-    for query_def in queries:
-        metric_name = query_def['metric_name']
-        help_text = query_def.get('help', '')
-        metric_type = query_def.get('type', 'gauge')
-
-        metrics.append(f"# HELP {metric_name} {help_text}")
-        metrics.append(f"# TYPE {metric_name} {metric_type}")
-
-        logging.info(f"Executing query: {query_def['sql']}")
-        cursor.execute(query_def['sql'])
-
-        for row in cursor.fetchall():
-            logging.debug(f"Query result row: {row}")
-            labels = []
-
-            for i, label in enumerate(query_def.get('labels', [])):
-                labels.append(f'{label}="{row[i]}"')
-
-            for k, v in query_def.get('static_labels', {}).items():
-                labels.append(f'{k}="{v}"')
-
-            value_index = len(query_def.get('labels', []))
-            value = query_def.get('static_value', None)
-
-            if value is None and query_def.get('values'):
-                raw_value = row[value_index]
-                value = format_value(raw_value)
-            elif value is not None:
-                value = format_value(value)
-
-            timestamp = ""
-            ts_col = query_def.get('timestamp_value')
-            if ts_col:
-                try:
-                    ts_index = query_def['labels'].index(ts_col) if ts_col in query_def['labels'] else value_index + 1
-                    ts_raw = row[ts_index]
-                    if isinstance(ts_raw, datetime.datetime):
-                        timestamp = f" {ts_raw.timestamp():.9e}"
-                except Exception as e:
-                    logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
-
-            metric = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
-            metrics.append(metric)
-
-    conn.close()
-    logging.info("Connection closed")
-    return metrics
+    def is_expired(self, max_lifetime):
+        return max_lifetime > 0 and (time.time() - self.created_at) > max_lifetime
+        
+def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
+    import datetime
+    import time
+    logging.info("Acquiring DB connection...")
 
 
+    conn_wrapper = None
+    try:
+        # Try to reuse a connection
+        while not connection_pool.empty():
+            candidate = connection_pool.get()
+            if candidate.is_expired(max_lifetime):
+                logging.info("Discarding expired connection")
+                candidate.conn.close()
+            else:
+                conn_wrapper = candidate
+                break
 
+        # Create new if none available
+        if conn_wrapper is None:
+            logging.info("Opening new DB connection")
+            conn = teradatasql.connect(**dsn_dict)
+            conn_wrapper = PooledConnection(conn)
 
+        cursor = conn_wrapper.conn.cursor()
+        metrics = []
+
+        for query_def in queries:
+            metric_name = query_def['metric_name']
+            help_text = query_def.get('help', '')
+            metric_type = query_def.get('type', 'gauge')
+
+            metrics.append(f"# HELP {metric_name} {help_text}")
+            metrics.append(f"# TYPE {metric_name} {metric_type}")
+
+            logging.info(f"Executing query: {query_def['sql']}")
+            cursor.execute(query_def['sql'])
+
+            for row in cursor.fetchall():
+                logging.debug(f"Query result row: {row}")
+                labels = []
+
+                for i, label in enumerate(query_def.get('labels', [])):
+                    labels.append(f'{label}="{row[i]}"')
+
+                for k, v in query_def.get('static_labels', {}).items():
+                    labels.append(f'{k}="{v}"')
+
+                value_index = len(query_def.get('labels', []))
+                value = query_def.get('static_value', None)
+
+                if value is None and query_def.get('values'):
+                    raw_value = row[value_index]
+                    value = format_value(raw_value)
+                elif value is not None:
+                    value = format_value(value)
+
+                timestamp = ""
+                ts_col = query_def.get('timestamp_value')
+                if ts_col:
+                    try:
+                        ts_index = query_def['labels'].index(ts_col) if ts_col in query_def['labels'] else value_index + 1
+                        ts_raw = row[ts_index]
+                        if isinstance(ts_raw, datetime.datetime):
+                            timestamp = f" {ts_raw.timestamp():.9e}"
+                    except Exception as e:
+                        logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
+
+                metric = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
+                metrics.append(metric)
+
+        # Return to pool if under idle limit
+        if connection_pool.qsize() < max_idle:
+            connection_pool.put(conn_wrapper)
+        else:
+            logging.info("Idle pool full, closing connection")
+            conn_wrapper.conn.close()
+
+        return metrics
+
+    except Exception as e:
+        if conn_wrapper:
+            conn_wrapper.conn.close()
+        raise e
 
 @app.route('/metrics')
 def metrics():
