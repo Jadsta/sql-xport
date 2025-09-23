@@ -7,7 +7,6 @@ from flask import Flask, request, Response
 import teradatasql
 import datetime
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -46,7 +45,7 @@ def resolve_collectors(config, base_dir):
     for file_path in collector_files:
         with open(file_path) as f:
             collector = yaml.safe_load(f)
-            collector_name = collector.get('collector_name')  # ✅ supports collector_name
+            collector_name = collector.get('collector_name')
             logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
             if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
                 matched_collectors.append((collector_name, collector))
@@ -78,12 +77,17 @@ def resolve_queries_from_metrics(collector):
 
     return resolved
 
-def load_queries_from_collectors(matched_collectors):
-    queries = []
-    for name, collector in matched_collectors:
-        logging.info(f"Loading collector: {name}")
-        queries.extend(resolve_queries_from_metrics(collector))
-    return queries
+def format_value(val):
+    if isinstance(val, datetime.datetime):
+        return f"{val.timestamp():.9e}"
+    try:
+        float_val = float(val)
+        if float_val >= 1e6 or float_val < 1e-3:
+            return f"{float_val:.9e}"
+        else:
+            return f"{float_val:.6f}".rstrip('0').rstrip('.')
+    except (ValueError, TypeError):
+        return "0"
 
 def run_queries(dsn_dict, queries):
     logging.info("Connecting to Teradata with DSN")
@@ -97,7 +101,6 @@ def run_queries(dsn_dict, queries):
         help_text = query_def.get('help', '')
         metric_type = query_def.get('type', 'gauge')
 
-        # Add HELP and TYPE headers
         metrics.append(f"# HELP {metric_name} {help_text}")
         metrics.append(f"# TYPE {metric_name} {metric_type}")
 
@@ -108,11 +111,9 @@ def run_queries(dsn_dict, queries):
             logging.debug(f"Query result row: {row}")
             labels = []
 
-            # Dynamic labels
             for i, label in enumerate(query_def.get('labels', [])):
                 labels.append(f'{label}="{row[i]}"')
 
-            # Static labels
             for k, v in query_def.get('static_labels', {}).items():
                 labels.append(f'{k}="{v}"')
 
@@ -121,17 +122,10 @@ def run_queries(dsn_dict, queries):
 
             if value is None and query_def.get('values'):
                 raw_value = row[value_index]
-                if isinstance(raw_value, datetime.datetime):
-                    value = f"{raw_value.timestamp():.9e}"
-                else:
-                    try:
-                        value = f"{float(raw_value):.9e}"
-                    except (ValueError, TypeError):
-                        value = "0"
+                value = format_value(raw_value)
             elif value is not None:
-                value = f"{float(value):.9e}"
+                value = format_value(value)
 
-            # Optional timestamp
             timestamp = ""
             ts_col = query_def.get('timestamp_value')
             if ts_col:
@@ -149,9 +143,6 @@ def run_queries(dsn_dict, queries):
     conn.close()
     logging.info("Connection closed")
     return metrics
-
-
-
 
 @app.route('/metrics')
 def metrics():
@@ -176,7 +167,7 @@ def metrics():
         target_name = config['target'].get('name', 'unknown')
 
         metrics_output.append(f'up{{target="{target_name}"}} 1')
-        metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
+        metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {format_value(duration)}")
 
         logging.info(f"Scrape completed in {duration:.3f} seconds")
         return Response("\n".join(metrics_output), mimetype='text/plain')
