@@ -12,6 +12,10 @@ def load_sql_exporter_config(exporter_name):
     with config_path.open() as f:
         return yaml.safe_load(f)
 
+def build_dsn(conn_config):
+    # Safely wrap values in quotes to handle special characters
+    return f'host="{conn_config["host"]}";user="{conn_config["user"]}";password="{conn_config["password"]}"'
+
 def resolve_collectors(config):
     collector_files = []
     for pattern in config.get('collector_files', []):
@@ -61,12 +65,15 @@ def metrics():
 
         collector_files = resolve_collectors(config)
         queries = load_queries_from_collectors(collector_files)
-        metrics_output = run_queries(config['target']['data_source_name'], queries)
+
+        conn_config = config['target']['connection']
+        dsn = build_dsn(conn_config)
+
+        metrics_output = run_queries(dsn, queries)
 
         duration = time.time() - start
         target_name = config['target'].get('name', 'unknown')
 
-        # Add default metrics
         metrics_output.append(f'up{{target="{target_name}"}} 1')
         metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
