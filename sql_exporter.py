@@ -45,10 +45,23 @@ def parse_duration(s):
         raise ValueError(f"Unrecognized duration format: {s}")
 
 def load_sql_exporter_config(exporter_name):
+    """
+    Loads the sql_exporter.yml file for the given exporter name.
+    Returns the parsed config dictionary and the base directory path.
+    """
+    from pathlib import Path
+    import yaml
+    import logging
+
     config_path = Path(f"./{exporter_name}/sql_exporter.yml")
     logging.info(f"Loading config from: {config_path}")
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
     with config_path.open() as f:
         config = yaml.safe_load(f)
+
     logging.debug(f"Loaded config: {config}")
     return config, config_path.parent
 
