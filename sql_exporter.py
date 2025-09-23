@@ -21,7 +21,7 @@ def load_sql_exporter_config(exporter_name):
     with config_path.open() as f:
         config = yaml.safe_load(f)
     logging.debug(f"Loaded config: {config}")
-    return config
+    return config, config_path.parent
 
 def build_dsn(conn_config):
     logging.debug(f"Building DSN from connection config: {conn_config}")
@@ -31,11 +31,12 @@ def build_dsn(conn_config):
         "password": conn_config["password"]
     }
 
-def resolve_collectors(config):
+def resolve_collectors(config, base_dir):
     collector_files = []
     logging.info(f"Resolving collector files using patterns: {config.get('collector_files', [])}")
     for pattern in config.get('collector_files', []):
-        matched = glob.glob(f"./{pattern}")
+        full_pattern = base_dir / pattern
+        matched = glob.glob(str(full_pattern))
         logging.debug(f"Pattern '{pattern}' matched files: {matched}")
         collector_files.extend(matched)
 
@@ -87,10 +88,10 @@ def metrics():
         return "Missing 'exporter' parameter", 400
 
     try:
-        config = load_sql_exporter_config(exporter)
+        config, base_dir = load_sql_exporter_config(exporter)
         start = time.time()
 
-        matched_collectors = resolve_collectors(config)
+        matched_collectors = resolve_collectors(config, base_dir)
         queries = load_queries_from_collectors(matched_collectors)
 
         conn_config = config['target']['connection']
