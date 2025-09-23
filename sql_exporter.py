@@ -1,25 +1,43 @@
 import yaml
 import glob
 import time
+import logging
 from pathlib import Path
 from flask import Flask, request, Response
 import teradatasql
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 app = Flask(__name__)
 
 def load_sql_exporter_config(exporter_name):
     config_path = Path(f"./{exporter_name}/sql_exporter.yml")
+    logging.info(f"Loading config from: {config_path}")
     with config_path.open() as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    logging.debug(f"Loaded config: {config}")
+    return config
 
 def build_dsn(conn_config):
-    # Safely wrap values in quotes to handle special characters
-    return f'host="{conn_config["host"]}";user="{conn_config["user"]}";password="{conn_config["password"]}"'
+    logging.debug(f"Building DSN from connection config: {conn_config}")
+    return {
+        "host": conn_config["host"],
+        "user": conn_config["user"],
+        "password": conn_config["password"]
+    }
 
 def resolve_collectors(config):
     collector_files = []
+    logging.info(f"Resolving collector files using patterns: {config.get('collector_files', [])}")
     for pattern in config.get('collector_files', []):
-        collector_files.extend(glob.glob(f"./{pattern}"))
+        matched = glob.glob(f"./{pattern}")
+        logging.debug(f"Pattern '{pattern}' matched files: {matched}")
+        collector_files.extend(matched)
 
     matched_collectors = []
     for file_path in collector_files:
@@ -27,36 +45,45 @@ def resolve_collectors(config):
         if any(glob.fnmatch.fnmatch(name, pattern) for pattern in config['target']['collectors']):
             matched_collectors.append(file_path)
 
+    logging.info(f"Matched collector files: {matched_collectors}")
     return matched_collectors
 
 def load_queries_from_collectors(file_paths):
     queries = []
     for path in file_paths:
+        logging.info(f"Loading collector: {path}")
         with open(path) as f:
             collector = yaml.safe_load(f)
+            logging.debug(f"Collector content: {collector}")
             queries.extend(collector.get('queries', []))
     return queries
 
-def run_queries(dsn, queries):
-    conn = teradatasql.connect(dsn)
+def run_queries(dsn_dict, queries):
+    logging.info("Connecting to Teradata with DSN")
+    logging.debug(f"DSN dict: {dsn_dict}")
+    conn = teradatasql.connect(**dsn_dict)
     cursor = conn.cursor()
     metrics = []
 
     for query_def in queries:
+        logging.info(f"Executing query: {query_def['sql']}")
         cursor.execute(query_def['sql'])
         for row in cursor.fetchall():
+            logging.debug(f"Query result row: {row}")
             labels = ",".join(f'{label}="{row[i]}"' for i, label in enumerate(query_def.get('labels', [])))
             value = row[len(query_def.get('labels', []))]
             metric = f"{query_def['metric_name']}{{{labels}}} {value}"
             metrics.append(metric)
 
     conn.close()
+    logging.info("Connection closed")
     return metrics
 
 @app.route('/metrics')
 def metrics():
     exporter = request.args.get('exporter')
     if not exporter:
+        logging.warning("Missing 'exporter' parameter in request")
         return "Missing 'exporter' parameter", 400
 
     try:
@@ -77,10 +104,13 @@ def metrics():
         metrics_output.append(f'up{{target="{target_name}"}} 1')
         metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
+        logging.info(f"Scrape completed in {duration:.3f} seconds")
         return Response("\n".join(metrics_output), mimetype='text/plain')
 
     except Exception as e:
+        logging.error(f"Error during scrape: {str(e)}")
         return Response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', mimetype='text/plain', status=500)
 
 if __name__ == '__main__':
+    logging.info("Starting SQL Exporter on port 8000")
     app.run(host='0.0.0.0', port=8000)
