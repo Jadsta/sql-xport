@@ -44,7 +44,7 @@ def resolve_collectors(config, base_dir):
     for file_path in collector_files:
         with open(file_path) as f:
             collector = yaml.safe_load(f)
-            collector_name = collector.get('name')
+            collector_name = collector.get('collector_name')  # ✅ FIXED HERE
             logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
             if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
                 matched_collectors.append((collector_name, collector))
