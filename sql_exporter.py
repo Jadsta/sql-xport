@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from flask import Flask, request, Response
 import teradatasql
+import datetime
+
 
 # Configure logging
 logging.basicConfig(
