@@ -69,7 +69,11 @@ def resolve_queries_from_metrics(collector):
             'metric_name': metric['metric_name'],
             'labels': metric.get('key_labels', []),
             'static_labels': metric.get('static_labels', {}),
-            'values': metric.get('values', [])
+            'values': metric.get('values', []),
+            'help': metric.get('help', ''),
+            'type': metric.get('type', 'gauge'),
+            'timestamp_value': metric.get('timestamp_value'),
+            'static_value': metric.get('static_value')
         })
 
     return resolved
@@ -113,23 +117,39 @@ def run_queries(dsn_dict, queries):
                 labels.append(f'{k}="{v}"')
 
             value_index = len(query_def.get('labels', []))
-            raw_value = row[value_index] if query_def.get('values') else 1
+            value = query_def.get('static_value', None)
 
-            # Convert datetime to float timestamp
-            if isinstance(raw_value, datetime.datetime):
-                value = f"{raw_value.timestamp():.9e}"
-            else:
+            if value is None and query_def.get('values'):
+                raw_value = row[value_index]
+                if isinstance(raw_value, datetime.datetime):
+                    value = f"{raw_value.timestamp():.9e}"
+                else:
+                    try:
+                        value = f"{float(raw_value):.9e}"
+                    except (ValueError, TypeError):
+                        value = "0"
+            elif value is not None:
+                value = f"{float(value):.9e}"
+
+            # Optional timestamp
+            timestamp = ""
+            ts_col = query_def.get('timestamp_value')
+            if ts_col:
                 try:
-                    value = f"{float(raw_value):.9e}"
-                except (ValueError, TypeError):
-                    value = "0"
+                    ts_index = query_def['labels'].index(ts_col) if ts_col in query_def['labels'] else value_index + 1
+                    ts_raw = row[ts_index]
+                    if isinstance(ts_raw, datetime.datetime):
+                        timestamp = f" {ts_raw.timestamp():.9e}"
+                except Exception as e:
+                    logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
 
-            metric = f"{metric_name}{{{','.join(labels)}}} {value}"
+            metric = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
             metrics.append(metric)
 
     conn.close()
     logging.info("Connection closed")
     return metrics
+
 
 
 
