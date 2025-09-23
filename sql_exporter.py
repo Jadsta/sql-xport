@@ -80,15 +80,19 @@ def resolve_queries_from_metrics(collector):
     
 def format_value(val):
     if isinstance(val, datetime.datetime):
-        return f"{val.timestamp():.9e}"  # Always use scientific for timestamps
+        return f"{val.timestamp():.9e}"
+
     try:
         float_val = float(val)
-        if float_val >= 1e6 or float_val < 1e-3:
-            return f"{float_val:.9e}"  # Use scientific for very large/small
+        if float_val == 0:
+            return "0"
+        elif abs(float_val) >= 1e6 or abs(float_val) < 1e-3:
+            return f"{float_val:.9e}"
         else:
-            return f"{float_val:.6f}".rstrip('0').rstrip('.')  # Clean decimal
+            return f"{float_val:.6f}".rstrip('0').rstrip('.')
     except (ValueError, TypeError):
         return "0"
+
         
 def load_queries_from_collectors(matched_collectors):
     queries = []
