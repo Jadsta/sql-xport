@@ -41,21 +41,21 @@ def resolve_collectors(config):
 
     matched_collectors = []
     for file_path in collector_files:
-        name = Path(file_path).stem.replace(".collector", "")
-        if any(glob.fnmatch.fnmatch(name, pattern) for pattern in config['target']['collectors']):
-            matched_collectors.append(file_path)
+        with open(file_path) as f:
+            collector = yaml.safe_load(f)
+            collector_name = collector.get('name')
+            logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
+            if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
+                matched_collectors.append((collector_name, collector))
 
-    logging.info(f"Matched collector files: {matched_collectors}")
+    logging.info(f"Matched collectors: {[name for name, _ in matched_collectors]}")
     return matched_collectors
 
-def load_queries_from_collectors(file_paths):
+def load_queries_from_collectors(matched_collectors):
     queries = []
-    for path in file_paths:
-        logging.info(f"Loading collector: {path}")
-        with open(path) as f:
-            collector = yaml.safe_load(f)
-            logging.debug(f"Collector content: {collector}")
-            queries.extend(collector.get('queries', []))
+    for name, collector in matched_collectors:
+        logging.info(f"Loading collector: {name}")
+        queries.extend(collector.get('queries', []))
     return queries
 
 def run_queries(dsn_dict, queries):
@@ -90,8 +90,8 @@ def metrics():
         config = load_sql_exporter_config(exporter)
         start = time.time()
 
-        collector_files = resolve_collectors(config)
-        queries = load_queries_from_collectors(collector_files)
+        matched_collectors = resolve_collectors(config)
+        queries = load_queries_from_collectors(matched_collectors)
 
         conn_config = config['target']['connection']
         dsn = build_dsn(conn_config)
