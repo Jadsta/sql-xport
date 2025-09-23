@@ -254,13 +254,21 @@ def metrics():
         config, base_dir = load_sql_exporter_config(exporter)
         start = time.time()
 
+        # 🔥 Add this block right here
+        global_config = config.get('global', {})
+        max_conn = global_config.get('max_connections', 1)
+        max_idle = global_config.get('max_idle_connections', 1)
+        max_lifetime = parse_duration(global_config.get('max_connection_lifetime', '0'))
+        connection_pool = Queue(maxsize=max_conn)
+
         matched_collectors = resolve_collectors(config, base_dir)
         queries = load_queries_from_collectors(matched_collectors)
 
         conn_config = config['target']['connection']
         dsn = build_dsn(conn_config)
 
-        metrics_output = run_queries(dsn, queries)
+        # 🔧 Pass the pool and limits into run_queries
+        metrics_output = run_queries(dsn, queries, connection_pool, max_idle, max_lifetime)
 
         duration = time.time() - start
         target_name = config['target'].get('name', 'unknown')
