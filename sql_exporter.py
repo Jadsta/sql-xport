@@ -87,8 +87,17 @@ def run_queries(dsn_dict, queries):
     metrics = []
 
     for query_def in queries:
+        metric_name = query_def['metric_name']
+        help_text = query_def.get('help', '')
+        metric_type = query_def.get('type', 'gauge')
+
+        # Add HELP and TYPE headers
+        metrics.append(f"# HELP {metric_name} {help_text}")
+        metrics.append(f"# TYPE {metric_name} {metric_type}")
+
         logging.info(f"Executing query: {query_def['sql']}")
         cursor.execute(query_def['sql'])
+
         for row in cursor.fetchall():
             logging.debug(f"Query result row: {row}")
             labels = []
@@ -102,13 +111,25 @@ def run_queries(dsn_dict, queries):
                 labels.append(f'{k}="{v}"')
 
             value_index = len(query_def.get('labels', []))
-            value = row[value_index] if query_def.get('values') else 1
-            metric = f"{query_def['metric_name']}{{{','.join(labels)}}} {value}"
+            raw_value = row[value_index] if query_def.get('values') else 1
+
+            # Convert datetime to float timestamp
+            if isinstance(raw_value, datetime.datetime):
+                value = f"{raw_value.timestamp():.9e}"
+            else:
+                try:
+                    value = f"{float(raw_value):.9e}"
+                except (ValueError, TypeError):
+                    value = "0"
+
+            metric = f"{metric_name}{{{','.join(labels)}}} {value}"
             metrics.append(metric)
 
     conn.close()
     logging.info("Connection closed")
     return metrics
+
+
 
 @app.route('/metrics')
 def metrics():
