@@ -44,7 +44,7 @@ def resolve_collectors(config, base_dir):
     for file_path in collector_files:
         with open(file_path) as f:
             collector = yaml.safe_load(f)
-            collector_name = collector.get('collector_name')  # ✅ FIXED HERE
+            collector_name = collector.get('collector_name')  # ✅ supports collector_name
             logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
             if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
                 matched_collectors.append((collector_name, collector))
@@ -52,11 +52,31 @@ def resolve_collectors(config, base_dir):
     logging.info(f"Matched collectors: {[name for name, _ in matched_collectors]}")
     return matched_collectors
 
+def resolve_queries_from_metrics(collector):
+    query_map = {q['query_name']: q['query'] for q in collector.get('queries', [])}
+    resolved = []
+
+    for metric in collector.get('metrics', []):
+        query_text = metric.get('query') or query_map.get(metric.get('query_ref'))
+        if not query_text:
+            logging.warning(f"Missing query for metric: {metric.get('metric_name')}")
+            continue
+
+        resolved.append({
+            'sql': query_text,
+            'metric_name': metric['metric_name'],
+            'labels': metric.get('key_labels', []),
+            'static_labels': metric.get('static_labels', {}),
+            'values': metric.get('values', [])
+        })
+
+    return resolved
+
 def load_queries_from_collectors(matched_collectors):
     queries = []
     for name, collector in matched_collectors:
         logging.info(f"Loading collector: {name}")
-        queries.extend(collector.get('queries', []))
+        queries.extend(resolve_queries_from_metrics(collector))
     return queries
 
 def run_queries(dsn_dict, queries):
@@ -71,9 +91,19 @@ def run_queries(dsn_dict, queries):
         cursor.execute(query_def['sql'])
         for row in cursor.fetchall():
             logging.debug(f"Query result row: {row}")
-            labels = ",".join(f'{label}="{row[i]}"' for i, label in enumerate(query_def.get('labels', [])))
-            value = row[len(query_def.get('labels', []))]
-            metric = f"{query_def['metric_name']}{{{labels}}} {value}"
+            labels = []
+
+            # Dynamic labels
+            for i, label in enumerate(query_def.get('labels', [])):
+                labels.append(f'{label}="{row[i]}"')
+
+            # Static labels
+            for k, v in query_def.get('static_labels', {}).items():
+                labels.append(f'{k}="{v}"')
+
+            value_index = len(query_def.get('labels', []))
+            value = row[value_index] if query_def.get('values') else 1
+            metric = f"{query_def['metric_name']}{{{','.join(labels)}}} {value}"
             metrics.append(metric)
 
     conn.close()
