@@ -1,11 +1,14 @@
-import yaml
-import glob
-import time
-import logging
-from pathlib import Path
-from flask import Flask, request, Response
-import teradatasql
-import datetime
+import yaml                     # For loading .yml config and collector files
+import glob                     # For resolving collector file patterns
+import time                     # For timestamps and connection lifetime tracking
+import logging                  # For structured logging
+from pathlib import Path        # For clean file path handling
+from flask import Flask, request, Response  # For HTTP metrics endpoint
+import teradatasql              # For connecting to Teradata
+import datetime                 # For handling datetime values and formatting
+from threading import Semaphore # For limiting concurrent connections
+from queue import Queue         # For managing idle connection pool
+
 
 
 # Configure logging
