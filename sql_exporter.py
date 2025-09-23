@@ -7,6 +7,7 @@ from flask import Flask, request, Response
 import teradatasql
 import datetime
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -45,7 +46,7 @@ def resolve_collectors(config, base_dir):
     for file_path in collector_files:
         with open(file_path) as f:
             collector = yaml.safe_load(f)
-            collector_name = collector.get('collector_name')
+            collector_name = collector.get('collector_name')  # ✅ supports collector_name
             logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
             if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
                 matched_collectors.append((collector_name, collector))
@@ -76,18 +77,25 @@ def resolve_queries_from_metrics(collector):
         })
 
     return resolved
-
+    
 def format_value(val):
     if isinstance(val, datetime.datetime):
-        return f"{val.timestamp():.9e}"
+        return f"{val.timestamp():.9e}"  # Always use scientific for timestamps
     try:
         float_val = float(val)
         if float_val >= 1e6 or float_val < 1e-3:
-            return f"{float_val:.9e}"
+            return f"{float_val:.9e}"  # Use scientific for very large/small
         else:
-            return f"{float_val:.6f}".rstrip('0').rstrip('.')
+            return f"{float_val:.6f}".rstrip('0').rstrip('.')  # Clean decimal
     except (ValueError, TypeError):
         return "0"
+        
+def load_queries_from_collectors(matched_collectors):
+    queries = []
+    for name, collector in matched_collectors:
+        logging.info(f"Loading collector: {name}")
+        queries.extend(resolve_queries_from_metrics(collector))
+    return queries
 
 def run_queries(dsn_dict, queries):
     logging.info("Connecting to Teradata with DSN")
@@ -144,6 +152,10 @@ def run_queries(dsn_dict, queries):
     logging.info("Connection closed")
     return metrics
 
+
+
+
+
 @app.route('/metrics')
 def metrics():
     exporter = request.args.get('exporter')
@@ -167,7 +179,7 @@ def metrics():
         target_name = config['target'].get('name', 'unknown')
 
         metrics_output.append(f'up{{target="{target_name}"}} 1')
-        metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {format_value(duration)}")
+        metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
         logging.info(f"Scrape completed in {duration:.3f} seconds")
         return Response("\n".join(metrics_output), mimetype='text/plain')
