@@ -9,7 +9,6 @@ import datetime                 # For handling datetime values and formatting
 from threading import Semaphore # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
 from collections import defaultdict
-from collections import defaultdict
 
 
 
