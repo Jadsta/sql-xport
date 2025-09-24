@@ -8,6 +8,7 @@ import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
 from threading import Semaphore # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
+from collections import defaultdict
 
 
 
@@ -251,7 +252,33 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             logging.info("Idle pool full, closing connection")
             conn_wrapper.conn.close()
 
-        return metrics
+        grouped = defaultdict(list)
+        help_map = {}
+        type_map = {}
+        
+        for line in metrics:
+            if line.startswith("# HELP"):
+                parts = line.split(" ", 2)
+                help_map[parts[1]] = line
+            elif line.startswith("# TYPE"):
+                parts = line.split(" ", 2)
+                type_map[parts[1]] = line
+            else:
+                metric_name = line.split("{")[0]
+                grouped[metric_name].append(line)
+        
+        # Sort keys and rebuild output
+        sorted_output = []
+        for metric_name in sorted(grouped.keys()):
+            if metric_name in help_map:
+                sorted_output.append(help_map[metric_name])
+            if metric_name in type_map:
+                sorted_output.append(type_map[metric_name])
+            sorted_output.extend(grouped[metric_name])
+        
+        return sorted_output
+
+
 
     except Exception as e:
         if conn_wrapper:
@@ -288,10 +315,11 @@ def metrics():
         metrics_output = run_queries(dsn, queries, connection_pool, max_idle, max_lifetime)
 
         duration = time.time() - start
-        target_name = config['target'].get('name', 'unknown')
+        target_name = config['target'].get('name')
 
-        metrics_output.append(f'up{{target="{target_name}"}} 1')
-        metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
+        if target_name:
+            metrics_output.append(f'up{{target="{target_name}"}} 1')
+            metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
         logging.info(f"Scrape completed in {duration:.3f} seconds")
         return Response("\n".join(metrics_output), mimetype='text/plain')
