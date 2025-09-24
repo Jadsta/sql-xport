@@ -202,8 +202,9 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
                     if col[0].lower() in [l.lower() for l in query_def.get('labels', [])]
                 ]
 
-                for i, label in enumerate(query_def.get('labels', [])):
-                    labels.append(f'{label}="{row[i]}"')
+                for i in label_indexes:
+                    col_name = cursor.description[i][0]
+                    labels.append(f'{col_name}="{row[i]}"')
 
                 for k, v in query_def.get('static_labels', {}).items():
                     labels.append(f'{k}="{v}"')
