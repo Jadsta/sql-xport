@@ -181,7 +181,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             conn_wrapper = PooledConnection(conn)
 
         cursor = conn_wrapper.conn.cursor()
-        raw_metrics = []
+        metric_blocks = defaultdict(list)
 
         for query_def in queries:
             metric_name = query_def['metric_name']
@@ -189,8 +189,8 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             metric_type = query_def.get('type', 'gauge')
 
             # Add HELP and TYPE lines
-            raw_metrics.append(f"# HELP {metric_name} {help_text}")
-            raw_metrics.append(f"# TYPE {metric_name} {metric_type}")
+            metric_blocks[metric_name].append(f"# HELP {metric_name} {help_text}")
+            metric_blocks[metric_name].append(f"# TYPE {metric_name} {metric_type}")
 
             logging.info(f"Executing query: {query_def['sql']}")
             cursor.execute(query_def['sql'])
@@ -241,7 +241,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
                         logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
 
                 metric_line = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
-                raw_metrics.append(metric_line)
+                metric_blocks[metric_name].append(metric_line)
 
         # Return to pool if under idle limit
         if connection_pool.qsize() < max_idle:
@@ -250,23 +250,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             logging.info("Idle pool full, closing connection")
             conn_wrapper.conn.close()
 
-        # Group and sort metrics
-        grouped = defaultdict(list)
-        for line in raw_metrics:
-            if line.startswith("# HELP") or line.startswith("# TYPE"):
-                continue
-            metric_name = line.split("{")[0]
-            grouped[metric_name].append(line)
-
+        # Sort metrics alphabetically by metric name
         sorted_output = []
-        for metric_name in sorted(grouped.keys()):
-            # Re-add HELP and TYPE lines from raw_metrics
-            for line in raw_metrics:
-                if line.startswith(f"# HELP {metric_name}"):
-                    sorted_output.append(line)
-                elif line.startswith(f"# TYPE {metric_name}"):
-                    sorted_output.append(line)
-            sorted_output.extend(grouped[metric_name])
+        for metric_name in sorted(metric_blocks.keys()):
+            sorted_output.extend(metric_blocks[metric_name])
 
         return sorted_output
 
