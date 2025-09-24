@@ -9,6 +9,7 @@ import datetime                 # For handling datetime values and formatting
 from threading import Semaphore # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
 from collections import defaultdict
+from collections import defaultdict
 
 
 
@@ -251,12 +252,24 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             logging.info("Idle pool full, closing connection")
             conn_wrapper.conn.close()
 
-        # Group and sort metrics
+        help_map = {}
+        type_map = {}
+        
+        # Group metrics by name
         grouped = defaultdict(list)
+        
         for line in metrics:
-            metric_name = line.split("{")[0]
-            grouped[metric_name].append(line)
-
+            if line.startswith("# HELP"):
+                parts = line.split(" ", 2)
+                help_map[parts[1]] = line
+            elif line.startswith("# TYPE"):
+                parts = line.split(" ", 2)
+                type_map[parts[1]] = line
+            else:
+                metric_name = line.split("{")[0]
+                grouped[metric_name].append(line)
+        
+        # Rebuild sorted output
         sorted_output = []
         for metric_name in sorted(grouped.keys()):
             if metric_name in help_map:
@@ -264,8 +277,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             if metric_name in type_map:
                 sorted_output.append(type_map[metric_name])
             sorted_output.extend(grouped[metric_name])
-
+        
         return sorted_output
+
+
 
     except Exception as e:
         if conn_wrapper:
