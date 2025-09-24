@@ -8,6 +8,7 @@ import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
 from threading import Semaphore # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
+from collections import defaultdict
 
 
 
@@ -158,8 +159,8 @@ class PooledConnection:
 def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
     import datetime
     import time
+    from collections import defaultdict
     logging.info("Acquiring DB connection...")
-
 
     conn_wrapper = None
     try:
@@ -181,14 +182,16 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
 
         cursor = conn_wrapper.conn.cursor()
         metrics = []
+        help_map = {}
+        type_map = {}
 
         for query_def in queries:
             metric_name = query_def['metric_name']
             help_text = query_def.get('help', '')
             metric_type = query_def.get('type', 'gauge')
 
-            metrics.append(f"# HELP {metric_name} {help_text}")
-            metrics.append(f"# TYPE {metric_name} {metric_type}")
+            help_map[metric_name] = f"# HELP {metric_name} {help_text}"
+            type_map[metric_name] = f"# TYPE {metric_name} {metric_type}"
 
             logging.info(f"Executing query: {query_def['sql']}")
             cursor.execute(query_def['sql'])
@@ -196,48 +199,45 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             for row in cursor.fetchall():
                 logging.debug(f"Query result row: {row}")
                 labels = []
-                
-                label_indexes = [
-                    i for i, col in enumerate(cursor.description)
-                    if col[0].lower() in [l.lower() for l in query_def.get('labels', [])]
-                ]
 
-                for i in label_indexes:
-                    col_name = cursor.description[i][0]
-                    labels.append(f'{col_name}="{row[i]}"')
+                # Resolve labels by column name
+                for label in query_def.get('labels', []):
+                    try:
+                        i = next(idx for idx, col in enumerate(cursor.description) if col[0].lower() == label.lower())
+                        labels.append(f'{label}="{row[i]}"')
+                    except StopIteration:
+                        logging.warning(f"Label column '{label}' not found in result set for metric {metric_name}")
 
+                # Add static labels
                 for k, v in query_def.get('static_labels', {}).items():
                     labels.append(f'{k}="{v}"')
 
-                value_index = len(query_def.get('labels', []))
+                # Resolve value
                 value = query_def.get('static_value', None)
-
                 if value is None and query_def.get('values'):
                     value_column = query_def['values'][0]
                     try:
-                        value_index = cursor.description.index(next(d for d in cursor.description if d[0].lower() == value_column.lower()))
+                        value_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == value_column.lower())
                         raw_value = row[value_index]
                         value = format_value(raw_value)
                     except Exception as e:
                         logging.warning(f"Could not resolve value column '{value_column}' for metric {metric_name}: {e}")
                         value = "0"
+                else:
+                    value = format_value(value)
 
+                # Resolve timestamp
                 timestamp = ""
                 ts_col = query_def.get('timestamp_value')
                 if ts_col:
                     try:
-                        # Match column name to index using cursor.description
                         ts_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == ts_col.lower())
                         ts_raw = row[ts_index]
-                
                         if isinstance(ts_raw, datetime.datetime):
-                            # Match Go exporter: milliseconds since epoch
                             timestamp = f" {int(ts_raw.timestamp() * 1000)}"
                         elif isinstance(ts_raw, datetime.date):
                             dt = datetime.datetime.combine(ts_raw, datetime.time())
                             timestamp = f" {int(dt.timestamp() * 1000)}"
-                        else:
-                            logging.warning(f"Timestamp column '{ts_col}' is not datetime/date for metric {metric_name}")
                     except Exception as e:
                         logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
 
@@ -251,7 +251,21 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             logging.info("Idle pool full, closing connection")
             conn_wrapper.conn.close()
 
-        return metrics
+        # Group and sort metrics
+        grouped = defaultdict(list)
+        for line in metrics:
+            metric_name = line.split("{")[0]
+            grouped[metric_name].append(line)
+
+        sorted_output = []
+        for metric_name in sorted(grouped.keys()):
+            if metric_name in help_map:
+                sorted_output.append(help_map[metric_name])
+            if metric_name in type_map:
+                sorted_output.append(type_map[metric_name])
+            sorted_output.extend(grouped[metric_name])
+
+        return sorted_output
 
     except Exception as e:
         if conn_wrapper:
@@ -288,10 +302,11 @@ def metrics():
         metrics_output = run_queries(dsn, queries, connection_pool, max_idle, max_lifetime)
 
         duration = time.time() - start
-        target_name = config['target'].get('name', 'unknown')
+        target_name = config['target'].get('name')
 
-        metrics_output.append(f'up{{target="{target_name}"}} 1')
-        metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
+        if target_name:
+            metrics_output.append(f'up{{target="{target_name}"}} 1')
+            metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
         logging.info(f"Scrape completed in {duration:.3f} seconds")
         return Response("\n".join(metrics_output), mimetype='text/plain')
