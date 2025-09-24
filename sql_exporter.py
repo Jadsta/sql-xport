@@ -210,10 +210,14 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
                 value = query_def.get('static_value', None)
 
                 if value is None and query_def.get('values'):
-                    raw_value = row[value_index]
-                    value = format_value(raw_value)
-                elif value is not None:
-                    value = format_value(value)
+                    value_column = query_def['values'][0]
+                    try:
+                        value_index = cursor.description.index(next(d for d in cursor.description if d[0].lower() == value_column.lower()))
+                        raw_value = row[value_index]
+                        value = format_value(raw_value)
+                    except Exception as e:
+                        logging.warning(f"Could not resolve value column '{value_column}' for metric {metric_name}: {e}")
+                        value = "0"
 
                 timestamp = ""
                 ts_col = query_def.get('timestamp_value')
