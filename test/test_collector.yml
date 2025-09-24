@@ -1,0 +1,58 @@
+collector_name: "test_metrics"
+
+queries:
+  - query_name: "static_query"
+    query: |
+      SELECT 'static' AS label, 42 AS int_val, 3.1415 AS float_val, 'hello' AS str_val,
+             DATE '2023-01-01' AS date_val, CURRENT_TIMESTAMP AS ts_val
+
+metrics:
+  - metric_name: "teradata_static_int"
+    query_ref: "static_query"
+    key_labels: ["label"]
+    values: ["int_val"]
+    help: "Static integer value"
+    type: gauge
+
+  - metric_name: "teradata_static_float"
+    query_ref: "static_query"
+    key_labels: ["label"]
+    values: ["float_val"]
+    help: "Static float value"
+    type: gauge
+
+  - metric_name: "teradata_static_string"
+    query_ref: "static_query"
+    key_labels: ["label", "str_val"]
+    static_value: 1
+    help: "String label test"
+    type: counter
+
+  - metric_name: "teradata_static_date"
+    query_ref: "static_query"
+    key_labels: ["label"]
+    values: ["date_val"]
+    help: "Date value test"
+    type: gauge
+
+  - metric_name: "teradata_static_timestamp"
+    query_ref: "static_query"
+    key_labels: ["label"]
+    values: ["int_val"]
+    timestamp_value: "ts_val"
+    help: "Timestamp injection test"
+    type: gauge
+
+  - metric_name: "teradata_static_summary"
+    query_ref: "static_query"
+    key_labels: ["label"]
+    values: ["float_val"]
+    help: "Summary metric test"
+    type: summary
+
+  - metric_name: "teradata_static_histogram"
+    query_ref: "static_query"
+    key_labels: ["label"]
+    values: ["float_val"]
+    help: "Histogram metric test"
+    type: histogram

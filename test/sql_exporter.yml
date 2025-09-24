@@ -1,0 +1,17 @@
+global:
+  scrape_timeout_offset: 500ms
+  max_connections: 2
+  max_idle_connections: 1
+  max_connection_lifetime: 5m
+
+target:
+  name: "teradata_test"
+  collectors:
+    - "test_metrics"
+  connection:
+    host: "your-teradata-host"
+    user: "your-user"
+    password: "your-password"
+
+collector_files:
+  - "test_collector.yml"
