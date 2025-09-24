@@ -131,7 +131,7 @@ def format_value(val):
         if float_val == 0:
             return "0"
         elif abs(float_val) >= 1e6 or abs(float_val) < 1e-3:
-            return f"{float_val:.9e}"
+            return f"{float_val:.7e}"
         else:
             return f"{float_val:.6f}".rstrip('0').rstrip('.')
     except (ValueError, TypeError):
@@ -196,6 +196,11 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             for row in cursor.fetchall():
                 logging.debug(f"Query result row: {row}")
                 labels = []
+                
+                label_indexes = [
+                    i for i, col in enumerate(cursor.description)
+                    if col[0].lower() in [l.lower() for l in query_def.get('labels', [])]
+                ]
 
                 for i, label in enumerate(query_def.get('labels', [])):
                     labels.append(f'{label}="{row[i]}"')
@@ -220,10 +225,18 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
                 ts_col = query_def.get('timestamp_value')
                 if ts_col:
                     try:
-                        ts_index = query_def['labels'].index(ts_col) if ts_col in query_def['labels'] else value_index + 1
+                        # Match column name to index using cursor.description
+                        ts_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == ts_col.lower())
                         ts_raw = row[ts_index]
+                
                         if isinstance(ts_raw, datetime.datetime):
-                            timestamp = f" {ts_raw.timestamp():.9e}"
+                            # Match Go exporter: milliseconds since epoch
+                            timestamp = f" {int(ts_raw.timestamp() * 1000)}"
+                        elif isinstance(ts_raw, datetime.date):
+                            dt = datetime.datetime.combine(ts_raw, datetime.time())
+                            timestamp = f" {int(dt.timestamp() * 1000)}"
+                        else:
+                            logging.warning(f"Timestamp column '{ts_col}' is not datetime/date for metric {metric_name}")
                     except Exception as e:
                         logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
 
