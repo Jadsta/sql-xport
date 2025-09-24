@@ -252,9 +252,11 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             logging.info("Idle pool full, closing connection")
             conn_wrapper.conn.close()
 
-        grouped = defaultdict(list)
         help_map = {}
         type_map = {}
+        
+        # Group metrics by name
+        grouped = defaultdict(list)
         
         for line in metrics:
             if line.startswith("# HELP"):
@@ -267,7 +269,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
                 metric_name = line.split("{")[0]
                 grouped[metric_name].append(line)
         
-        # Sort keys and rebuild output
+        # Rebuild sorted output
         sorted_output = []
         for metric_name in sorted(grouped.keys()):
             if metric_name in help_map:
