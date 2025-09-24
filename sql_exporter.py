@@ -119,17 +119,12 @@ def resolve_queries_from_metrics(collector):
     return resolved
     
 def format_value(val):
-    """
-    Formats a value for Prometheus output:
-    - datetime → scientific notation timestamp
-    - zero → "0"
-    - very large/small floats → scientific notation
-    - regular numbers → clean decimal format
-    """
-    import datetime
-
     if isinstance(val, datetime.datetime):
         return f"{val.timestamp():.9e}"
+    if isinstance(val, datetime.date):
+        # Convert to datetime for timestamp
+        dt = datetime.datetime.combine(val, datetime.time())
+        return f"{dt.timestamp():.9e}"
 
     try:
         float_val = float(val)
@@ -141,6 +136,8 @@ def format_value(val):
             return f"{float_val:.6f}".rstrip('0').rstrip('.')
     except (ValueError, TypeError):
         return "0"
+
+
 
         
 def load_queries_from_collectors(matched_collectors):
