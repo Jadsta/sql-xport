@@ -73,11 +73,16 @@ def load_sql_exporter_config(exporter_name):
 
 def build_dsn(conn_config):
     logging.debug(f"Building DSN from connection config: {conn_config}")
-    return {
+    dsn = {
         "host": conn_config["host"],
         "user": conn_config["user"],
         "password": conn_config["password"]
     }
+    # Include optional parameters if present
+    for key in ["logmech", "connect_timeout"]:
+        if key in conn_config:
+            dsn[key] = conn_config[key]
+    return dsn
 
 def resolve_collectors(config, base_dir):
     collector_files = []
@@ -169,19 +174,25 @@ def connect_with_retries(conn_config):
     last_exc = None
     for attempt in range(1, retries + 1):
         logging.debug(f"Attempt {attempt}: Trying to connect with DSN: {dsn} and config: {conn_config}")
+        start_time = time.time()
         try:
             # Pass connect_timeout if supported by teradatasql
             if connect_timeout is not None:
-                dsn['logmech'] = dsn.get('logmech', None)  # placeholder for other options
                 dsn['connect_timeout'] = connect_timeout
-            return teradatasql.connect(**dsn)
+            logging.info(f"Connection attempt {attempt} DSN: {dsn}")
+            conn = teradatasql.connect(**dsn)
+            elapsed = time.time() - start_time
+            logging.info(f"Connection attempt {attempt} succeeded in {elapsed:.2f} seconds.")
+            return conn
         except Exception as exc:
             last_exc = exc
-            logging.warning(f"Connection attempt {attempt} failed: {exc}")
+            elapsed = time.time() - start_time
+            tb = traceback.format_exc()
+            logging.warning(f"Connection attempt {attempt} failed after {elapsed:.2f} seconds: {exc}\nTraceback:\n{tb}")
             if attempt < retries:
                 time.sleep(delay)
     if last_exc is not None:
-        logging.error(f"All connection attempts failed. Last error: {last_exc}")
+        logging.error(f"All connection attempts failed. Last error: {last_exc}\nTraceback:\n{traceback.format_exc()}")
         raise last_exc
     else:
         logging.error(f"All connection attempts failed, but no exception was captured. DSN: {dsn}, config: {conn_config}")
