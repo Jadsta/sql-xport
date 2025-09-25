@@ -52,14 +52,14 @@ def parse_duration(s):
 
 def load_sql_exporter_config(exporter_name):
     """
-    Loads the sql_exporter.yml file for the given exporter name.
+    Loads the sql_exporter.yml file for the given exporter name from targets/<exporter>/sql_exporter.yml.
     Returns the parsed config dictionary and the base directory path.
     """
     from pathlib import Path
     import yaml
     import logging
 
-    config_path = Path(f"./{exporter_name}/sql_exporter.yml")
+    config_path = Path(f"./targets/{exporter_name}/sql_exporter.yml")
     logging.info(f"Loading config from: {config_path}")
 
     if not config_path.exists():
