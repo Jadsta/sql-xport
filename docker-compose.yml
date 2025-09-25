@@ -8,6 +8,8 @@ services:
       - "8000:8000"
     volumes:
       - ./targets:/home/tdmon/app/targets
+      - ./settings.yml:/home/tdmon/app/settings.yml
+      - ./gunicorn_config.py:/home/tdmon/app/gunicorn_config.py
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
