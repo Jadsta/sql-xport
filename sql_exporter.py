@@ -88,8 +88,9 @@ def resolve_collectors(config, base_dir):
     collector_files = []
     logging.info(f"Resolving collector files using patterns: {config.get('collector_files', [])}")
     for pattern in config.get('collector_files', []):
+        # Only match files in the current exporter directory
         full_pattern = base_dir / pattern
-        matched = glob.glob(str(full_pattern))
+        matched = [str(p) for p in Path(base_dir).glob(pattern) if p.is_file()]
         logging.debug(f"Pattern '{pattern}' matched files: {matched}")
         collector_files.extend(matched)
 
@@ -97,7 +98,7 @@ def resolve_collectors(config, base_dir):
     for file_path in collector_files:
         with open(file_path) as f:
             collector = yaml.safe_load(f)
-            collector_name = collector.get('collector_name')  # ✅ supports collector_name
+            collector_name = collector.get('collector_name')
             logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
             if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
                 matched_collectors.append((collector_name, collector))
