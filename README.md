@@ -5,19 +5,22 @@ This project is a Prometheus exporter for Teradata, designed to run in productio
 
 ## Features
 - Connection pooling per data source, with limits set in `settings.yml`
-- Exporter configuration via individual YAML files
+- Exporter configuration via individual YAML files in the `targets/` directory
 - Blocking/waiting for connections when pool is exhausted
 - Gunicorn-ready for production deployment
 - Thread-safe connection management
 - Timezone support for metric timestamps (configurable per data source and exporter)
+- Advanced diagnostics and logging for connection and query issues
+- Option to force new connection for each scrape (for debugging)
 
 ## File Structure
 ```
 sql_exporter.py         # Main exporter application
 settings.yml            # Data source connection settings and pool sizes
-test/
-  sql_exporter.yml      # Example exporter configuration
-  test_collector.yml    # Example collector configuration
+targets/
+  <exporter>/           # Exporter directories (e.g., test, prod, etc.)
+    sql_exporter.yml    # Exporter configuration
+    <collector>.yml     # Collector configuration(s)
 gunicorn_config.py      # Gunicorn production settings
 ```
 
@@ -42,7 +45,7 @@ data_sources:
     # Add other connection settings as needed
 ```
 
-### sql_exporter.yml (example)
+### targets/<exporter>/sql_exporter.yml (example)
 Reference your data source and set exporter-specific limits and optional timezone override:
 ```yaml
 global:
@@ -90,15 +93,19 @@ keepalive = 2
 - Each exporter can use up to its own `max_connections` (from its yml), but only as many as are available in the pool.
 - If all connections are busy, requests will wait until a connection is available (blocking, not failing).
 - Timestamps for metrics use the timezone specified in the exporter config (if set), otherwise the data source, otherwise system timezone.
+- To debug connection/session issues, set `force_new_connection: true` in your data source config to bypass pooling for that source.
+- Diagnostic logs will show whether pooling or new connections are used for each scrape.
 
 ## Development & Testing
 - The Flask development server is disabled; always use Gunicorn for concurrency and production safety.
-- You can add more exporters and collectors by creating new yml files and referencing them in Prometheus scrape configs.
+- You can add more exporters by creating new directories under `targets/` and placing `sql_exporter.yml` and collector files inside.
+- Update your Prometheus scrape configs to reference the new exporter names.
 
 ## Troubleshooting
 - If you see `ImportError: No module named ...`, ensure all dependencies are installed.
 - If Prometheus scrapes time out, consider increasing pool size or reducing scrape frequency.
 - Adjust Gunicorn worker and thread counts for your server’s CPU and expected load.
+- Check logs for `[DEBUG]` messages to diagnose pooling and connection behavior.
 
 ## License
 MIT
