@@ -89,7 +89,6 @@ def resolve_collectors(config, base_dir):
     logging.info(f"Resolving collector files using patterns: {config.get('collector_files', [])}")
     for pattern in config.get('collector_files', []):
         # Only match files in the current exporter directory
-        full_pattern = base_dir / pattern
         matched = [str(p) for p in Path(base_dir).glob(pattern) if p.is_file()]
         logging.debug(f"Pattern '{pattern}' matched files: {matched}")
         collector_files.extend(matched)
