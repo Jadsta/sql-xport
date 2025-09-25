@@ -1,0 +1,10 @@
+bind = "0.0.0.0:8000"
+workers = 4  # Adjust based on CPU cores
+worker_class = "gthread"  # Use 'sync' for pure blocking, 'gthread' for lightweight concurrency
+threads = 4  # Number of threads per worker (for gthread)
+loglevel = "info"
+accesslog = "-"  # Log to stdout
+errorlog = "-"   # Log to stderr
+timeout = 60      # Worker timeout in seconds
+keepalive = 2     # Keep-alive for HTTP connections
+disable_redirect_access_to_syslog = True

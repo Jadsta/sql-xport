@@ -6,9 +6,13 @@ from pathlib import Path        # For clean file path handling
 from flask import Flask, request, Response  # For HTTP metrics endpoint
 import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
-from threading import Semaphore # For limiting concurrent connections
+from threading import Semaphore, Lock # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
 from collections import defaultdict
+import queue
+import pytz
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 
 
@@ -156,7 +160,27 @@ class PooledConnection:
     def is_expired(self, max_lifetime):
         return max_lifetime > 0 and (time.time() - self.created_at) > max_lifetime
         
-def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
+def connect_with_retries(conn_config):
+    retries = conn_config.get('connection_retries', 1)
+    delay = conn_config.get('retry_delay', 1)
+    connect_timeout = conn_config.get('connect_timeout', None)
+    dsn = build_dsn(conn_config)
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Pass connect_timeout if supported by teradatasql
+            if connect_timeout is not None:
+                dsn['logmech'] = dsn.get('logmech', None)  # placeholder for other options
+                dsn['connect_timeout'] = connect_timeout
+            return teradatasql.connect(**dsn)
+        except Exception as exc:
+            last_exc = exc
+            logging.warning(f"Connection attempt {attempt} failed: {exc}")
+            if attempt < retries:
+                time.sleep(delay)
+    raise last_exc
+
+def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, conn_config=None):
     import datetime
     import time
     from collections import defaultdict
@@ -176,8 +200,8 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
 
         # Create new if none available
         if conn_wrapper is None:
-            logging.info("Opening new DB connection")
-            conn = teradatasql.connect(**dsn_dict)
+            logging.info("Opening new DB connection with retries")
+            conn = connect_with_retries(conn_config or {})
             conn_wrapper = PooledConnection(conn)
 
         cursor = conn_wrapper.conn.cursor()
@@ -233,9 +257,12 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
                         ts_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == ts_col.lower())
                         ts_raw = row[ts_index]
                         if isinstance(ts_raw, datetime.datetime):
+                            if ts_raw.tzinfo is None:
+                                ts_raw = tz.localize(ts_raw)
                             timestamp = f" {int(ts_raw.timestamp() * 1000)}"
                         elif isinstance(ts_raw, datetime.date):
                             dt = datetime.datetime.combine(ts_raw, datetime.time())
+                            dt = tz.localize(dt)
                             timestamp = f" {int(dt.timestamp() * 1000)}"
                     except Exception as e:
                         logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
@@ -262,6 +289,60 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime):
             conn_wrapper.conn.close()
         raise e
 
+def load_settings(settings_path):
+    """
+    Loads the settings.yml file containing data source connection info.
+    """
+    with open(settings_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def get_connection_config_from_settings(data_source_name, settings_path):
+    settings = load_settings(settings_path)
+    data_sources = settings.get('data_sources', {})
+    if data_source_name not in data_sources:
+        raise KeyError(f"Data source '{data_source_name}' not found in settings.yml")
+    return data_sources[data_source_name]
+
+# Global connection pools per data source
+connection_pools = {}
+pool_locks = {}
+
+def get_or_create_pool(data_source_name, conn_config, max_pool_size):
+    """
+    Get or create a shared connection pool for the given data source.
+    """
+    global connection_pools, pool_locks
+    if data_source_name not in connection_pools:
+        connection_pools[data_source_name] = Queue(maxsize=max_pool_size)
+        pool_locks[data_source_name] = Lock()
+    return connection_pools[data_source_name], pool_locks[data_source_name]
+
+def acquire_connections(connection_pool, pool_lock, num_needed, timeout=30):
+    """
+    Acquire up to num_needed connections from the pool, blocking until available.
+    Returns a list of connections.
+    """
+    acquired = []
+    for _ in range(num_needed):
+        try:
+            conn = connection_pool.get(block=True, timeout=timeout)
+            acquired.append(conn)
+        except queue.Empty:
+            break  # Timeout reached, stop waiting
+    return acquired
+
+def get_timezone(global_config, conn_config):
+    tz_name = global_config.get('timezone') or conn_config.get('timezone') or 'system'
+    if tz_name == 'system':
+        # Use system local timezone
+        try:
+            import tzlocal
+            return tzlocal.get_localzone()
+        except ImportError:
+            return datetime.timezone.utc  # fallback to UTC
+    else:
+        return pytz.timezone(tz_name)
+
 @app.route('/metrics')
 def metrics():
     exporter = request.args.get('exporter')
@@ -275,21 +356,46 @@ def metrics():
 
         # ✅ Extract global settings
         global_config = config.get('global', {})
-        max_conn = global_config.get('max_connections', 1)
+        exporter_max_conn = global_config.get('max_connections', 1)
         max_idle = global_config.get('max_idle_connections', 1)
         max_lifetime = parse_duration(global_config.get('max_connection_lifetime', '0'))
+        scrape_timeout_offset = parse_duration(global_config.get('scrape_timeout_offset', '0'))
 
-        # ✅ Initialize connection pool
-        connection_pool = Queue(maxsize=max_conn)
+        # Load connection config from settings.yml using data_source_name
+        data_source_name = config['target']['data_source_name']
+        settings_path = base_dir / 'settings.yml'
+        conn_config = get_connection_config_from_settings(data_source_name, settings_path)
+        dsn = build_dsn(conn_config)
+        pool_size = conn_config.get('max_connections', 1)
+
+        # Get or create the shared pool for this data source
+        connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
         matched_collectors = resolve_collectors(config, base_dir)
         queries = load_queries_from_collectors(matched_collectors)
+        tz = get_timezone(global_config, conn_config)
 
-        conn_config = config['target']['connection']
-        dsn = build_dsn(conn_config)
+        # Acquire connections, blocking if necessary
+        with pool_lock:
+            num_to_acquire = min(exporter_max_conn, pool_size)
+            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire)
+            temp_pool = Queue(maxsize=num_to_acquire)
+            for conn in acquired_conns:
+                temp_pool.put(conn)
 
-        # ✅ Pass pool and limits into run_queries
-        metrics_output = run_queries(dsn, queries, connection_pool, max_idle, max_lifetime)
+        # Enforce scrape timeout using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config)
+            try:
+                metrics_output = future.result(timeout=scrape_timeout_offset)
+            except TimeoutError:
+                logging.error(f"Scrape exceeded timeout of {scrape_timeout_offset} seconds")
+                return Response(f'up{{target="unknown"}} 0\nerror{{message="scrape_timeout"}} 1', mimetype='text/plain', status=504)
+
+        # After scrape, return connections to the shared pool
+        with pool_lock:
+            while not temp_pool.empty():
+                connection_pool.put(temp_pool.get())
 
         duration = time.time() - start
         target_name = config['target'].get('name')
@@ -305,6 +411,4 @@ def metrics():
         logging.error(f"Error during scrape: {str(e)}")
         return Response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', mimetype='text/plain', status=500)
 
-if __name__ == '__main__':
-    logging.info("Starting SQL Exporter on port 8000")
-    app.run(host='0.0.0.0', port=8000)
+# Remove Flask dev server block for Gunicorn compatibility
