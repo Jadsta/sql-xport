@@ -363,7 +363,8 @@ def metrics():
 
         # Load connection config from settings.yml using data_source_name
         data_source_name = config['target']['data_source_name']
-        settings_path = base_dir / 'settings.yml'
+        # Always load settings.yml from the main script directory
+        settings_path = Path(__file__).parent / 'settings.yml'
         conn_config = get_connection_config_from_settings(data_source_name, settings_path)
         dsn = build_dsn(conn_config)
         pool_size = conn_config.get('max_connections', 1)
@@ -411,4 +412,29 @@ def metrics():
         logging.error(f"Error during scrape: {str(e)}")
         return Response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', mimetype='text/plain', status=500)
 
-# Remove Flask dev server block for Gunicorn compatibility
+# --- Pre-populate connection pools at startup ---
+def initialize_connection_pools():
+    try:
+        # Find all exporter configs in subfolders
+        for exporter_folder in Path(__file__).parent.glob('*/sql_exporter.yml'):
+            exporter_name = exporter_folder.parent.name
+            config, _ = load_sql_exporter_config(exporter_name)
+            data_source_name = config['target']['data_source_name']
+            settings_path = Path(__file__).parent / 'settings.yml'
+            conn_config = get_connection_config_from_settings(data_source_name, settings_path)
+            pool_size = conn_config.get('max_connections', 1)
+            connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
+            # Pre-populate pool with live connections
+            with pool_lock:
+                for _ in range(pool_size):
+                    try:
+                        conn = connect_with_retries(conn_config)
+                        connection_pool.put(PooledConnection(conn))
+                        logging.info(f"Pre-populated connection for data source '{data_source_name}'")
+                    except Exception as e:
+                        logging.error(f"Failed to pre-populate connection for '{data_source_name}': {e}")
+    except Exception as e:
+        logging.error(f"Error initializing connection pools: {e}")
+
+# Call this at startup
+initialize_connection_pools()
