@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  sql-exporter:
+    build: .
+    container_name: sql-exporter
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./targets:/home/tdmon/app/targets
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    user: tdmon
+    working_dir: /home/tdmon/app
