@@ -216,7 +216,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
     import datetime
     import time
     from collections import defaultdict
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
     logging.info("Acquiring DB connection(s) for parallel query execution...")
 
     query_retries = (conn_config or {}).get('query_retries', 1)
@@ -337,19 +337,29 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     logging.error(f"[ERROR] Failed to close connection after error: {close_exc}")
             raise e
 
-    # Run all queries in parallel
     metric_blocks = defaultdict(list)
+    results = {}
+    errors = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_query = {executor.submit(execute_query, q): q for q in queries}
-        for future in as_completed(future_to_query):
-            query_def = future_to_query[future]
-            metric_name = query_def['metric_name']
-            try:
-                metric_lines = future.result()
-                metric_blocks[metric_name].extend(metric_lines)
-            except Exception as e:
-                logging.error(f"Error running query for metric '{metric_name}': {e}")
-
+        try:
+            for future in as_completed(future_to_query, timeout=conn_config.get('scrape_timeout_offset', 0) or None):
+                query_def = future_to_query[future]
+                metric_name = query_def['metric_name']
+                try:
+                    metric_lines = future.result()
+                    metric_blocks[metric_name].extend(metric_lines)
+                    results[metric_name] = True
+                except Exception as e:
+                    logging.error(f"Error running query for metric '{metric_name}': {e}")
+                    errors[metric_name] = str(e)
+        except TimeoutError:
+            logging.error("Partial scrape: scrape_timeout reached, returning partial results.")
+            # Any futures not completed will be missing from results/errors
+    # Add error metrics for failed queries
+    for metric_name in errors:
+        metric_blocks[metric_name].append(f'up{{metric="{metric_name}"}} 0')
+        metric_blocks[metric_name].append(f'error{{metric="{metric_name}",message="{errors[metric_name]}"}} 1')
     # Sort metrics alphabetically by metric name
     sorted_output = []
     for metric_name in sorted(metric_blocks.keys()):
@@ -445,6 +455,11 @@ def metrics():
     if not exporter:
         logging.warning("Missing 'exporter' parameter in request")
         return "Missing 'exporter' parameter", 400
+    # Sanitize exporter name: only allow alphanumeric, underscore, dash
+    import re
+    if not re.match(r'^[A-Za-z0-9_-]+$', exporter):
+        logging.warning(f"Invalid exporter parameter: {exporter}")
+        return "Invalid 'exporter' parameter", 400
 
     try:
         config, base_dir = load_sql_exporter_config(exporter)
@@ -456,23 +471,38 @@ def metrics():
         max_idle = global_config.get('max_idle_connections', 1)
         max_lifetime = parse_duration(global_config.get('max_connection_lifetime', '0'))
         scrape_timeout_offset = parse_duration(global_config.get('scrape_timeout_offset', '0'))
-
         # Load connection config from settings.yml using data_source_name
         data_source_name = config['target']['data_source_name']
-        # Always load settings.yml from the main script directory
         settings_path = Path(__file__).parent / 'settings.yml'
         conn_config = get_connection_config_from_settings(data_source_name, settings_path)
+        # Get scrape_timeout from config, fallback to settings.yml, then default
+        settings = load_settings(settings_path)
+        settings_scrape_timeout = settings.get('scrape_timeout', 30)
+        scrape_timeout_val = global_config.get('scrape_timeout', settings_scrape_timeout)
+        scrape_timeout = parse_duration(str(scrape_timeout_val))
+
+        # --- Get Prometheus scrape timeout from header ---
+        prometheus_timeout = request.headers.get('X-Prometheus-Scrape-Timeout-Seconds')
+        if prometheus_timeout:
+            try:
+                prometheus_timeout = float(prometheus_timeout)
+            except Exception:
+                prometheus_timeout = None
+        # Calculate effective timeout
+        if prometheus_timeout:
+            effective_timeout = max(prometheus_timeout - scrape_timeout_offset, 0.1)
+        else:
+            effective_timeout = scrape_timeout
+
         dsn = build_dsn(conn_config)
         pool_size = conn_config.get('max_connections', 1)
 
-        # Get or create the shared pool for this data source
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
         matched_collectors = resolve_collectors(config, base_dir)
         queries = load_queries_from_collectors(matched_collectors)
         tz = get_timezone(global_config, conn_config)
 
-        # Acquire connections, blocking if necessary
         with pool_lock:
             num_to_acquire = min(exporter_max_conn, pool_size)
             acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, conn_config=conn_config, max_lifetime=max_lifetime)
@@ -480,16 +510,15 @@ def metrics():
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
-        # Enforce scrape timeout using ThreadPoolExecutor
+        # Enforce scrape timeout using effective_timeout
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config)
             try:
-                metrics_output = future.result(timeout=scrape_timeout_offset)
+                metrics_output = future.result(timeout=effective_timeout)
             except TimeoutError:
-                logging.error(f"Scrape exceeded timeout of {scrape_timeout_offset} seconds")
+                logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
                 return Response(f'up{{target="unknown"}} 0\nerror{{message="scrape_timeout"}} 1', mimetype='text/plain', status=504)
 
-        # After scrape, return connections to the shared pool
         with pool_lock:
             while not temp_pool.empty():
                 connection_pool.put(temp_pool.get())
