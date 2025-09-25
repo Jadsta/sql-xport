@@ -168,6 +168,7 @@ def connect_with_retries(conn_config):
     dsn = build_dsn(conn_config)
     last_exc = None
     for attempt in range(1, retries + 1):
+        logging.debug(f"Attempt {attempt}: Trying to connect with DSN: {dsn} and config: {conn_config}")
         try:
             # Pass connect_timeout if supported by teradatasql
             if connect_timeout is not None:
@@ -183,7 +184,7 @@ def connect_with_retries(conn_config):
         logging.error(f"All connection attempts failed. Last error: {last_exc}")
         raise last_exc
     else:
-        logging.error("All connection attempts failed, but no exception was captured.")
+        logging.error(f"All connection attempts failed, but no exception was captured. DSN: {dsn}, config: {conn_config}")
         raise Exception("Unknown connection error: no exception captured during retries")
 
 def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, conn_config=None):
