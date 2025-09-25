@@ -1,12 +1,12 @@
 FROM amazonlinux:latest
 
+# Install useradd and system dependencies
+RUN yum -y update && \
+    yum -y install shadow-utils python3 python3-pip gcc make && \
+    yum clean all
+
 # Create user tdmon
 RUN useradd -m -s /bin/bash tdmon
-
-# Install Python 3, pip, and system dependencies
-RUN yum -y update && \
-    yum -y install python3 python3-pip gcc make && \
-    yum clean all
 
 # Set up working directory
 WORKDIR /home/tdmon/app
