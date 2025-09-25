@@ -219,6 +219,8 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
     logging.info("Acquiring DB connection...")
 
     conn_wrapper = None
+    query_retries = (conn_config or {}).get('query_retries', 1)
+    query_retry_delay = (conn_config or {}).get('query_retry_delay', 1)
     try:
         # --- DEBUG: Option to force new connection for each scrape ---
         force_new_connection = conn_config.get('force_new_connection', False) if conn_config else False
@@ -247,8 +249,6 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 conn_wrapper = PooledConnection(conn)
 
         logging.info(f"[DEBUG] Connection object: {conn_wrapper.conn}")
-        cursor = conn_wrapper.conn.cursor()
-        logging.info(f"[DEBUG] Cursor object: {cursor}")
         metric_blocks = defaultdict(list)
 
         for query_def in queries:
@@ -261,15 +261,37 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             metric_blocks[metric_name].append(f"# TYPE {metric_name} {metric_type}")
 
             logging.info(f"Executing query: {query_def['sql']}")
-            logging.info(f"[DEBUG] Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
-            try:
-                cursor.execute(query_def['sql'])
-            except Exception as e:
-                tb = traceback.format_exc()
-                logging.error(f"[ERROR] Query execution failed for metric '{metric_name}': {e}\nTraceback:\n{tb}")
-                raise
+            attempt = 0
+            while attempt < query_retries:
+                try:
+                    cursor = conn_wrapper.conn.cursor()
+                    logging.info(f"[DEBUG] Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
+                    cursor.execute(query_def['sql'])
+                    rows = cursor.fetchall()
+                    break  # Success
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    logging.error(f"[ERROR] Query execution failed for metric '{metric_name}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
+                    # Check if error is connection-related
+                    if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower():
+                        try:
+                            conn_wrapper.conn.close()
+                        except Exception:
+                            pass
+                        logging.info("Attempting to acquire new connection after lost connection during query execution")
+                        conn = connect_with_retries(conn_config or {})
+                        conn_wrapper = PooledConnection(conn)
+                        attempt += 1
+                        if attempt < query_retries:
+                            time.sleep(query_retry_delay)
+                        continue
+                    else:
+                        raise  # Not a connection error, do not retry
+            else:
+                # All attempts failed
+                raise Exception(f"Query failed after {query_retries} retries due to lost connection.")
 
-            for row in cursor.fetchall():
+            for row in rows:
                 logging.debug(f"Query result row: {row}")
                 labels = []
 
@@ -369,18 +391,47 @@ def get_or_create_pool(data_source_name, conn_config, max_pool_size):
         pool_locks[data_source_name] = Lock()
     return connection_pools[data_source_name], pool_locks[data_source_name]
 
-def acquire_connections(connection_pool, pool_lock, num_needed, timeout=30):
+def acquire_connections(connection_pool, pool_lock, num_needed, timeout=30, conn_config=None, max_lifetime=0):
     """
-    Acquire up to num_needed connections from the pool, blocking until available.
+    Acquire up to num_needed live connections from the pool, replacing dead/expired ones with new connections.
     Returns a list of connections.
     """
     acquired = []
-    for _ in range(num_needed):
+    attempts = 0
+    while len(acquired) < num_needed and attempts < num_needed * 2:
+        attempts += 1
         try:
-            conn = connection_pool.get(block=True, timeout=timeout)
-            acquired.append(conn)
+            conn_wrapper = connection_pool.get(block=True, timeout=timeout)
+            # Check expiration and health
+            expired = conn_wrapper.is_expired(max_lifetime)
+            alive = is_connection_alive(conn_wrapper.conn)
+            if expired or not alive:
+                logging.info(f"Discarding pooled connection (expired={expired}, alive={alive})")
+                try:
+                    conn_wrapper.conn.close()
+                except Exception as e:
+                    logging.warning(f"Error closing dead/expired connection: {e}")
+                # Replace with new connection
+                if conn_config:
+                    try:
+                        new_conn = connect_with_retries(conn_config)
+                        acquired.append(PooledConnection(new_conn))
+                        logging.info("Replaced dead/expired connection with new live connection")
+                    except Exception as e:
+                        logging.error(f"Failed to create new connection after discarding dead/expired: {e}")
+                continue
+            acquired.append(conn_wrapper)
         except queue.Empty:
             break  # Timeout reached, stop waiting
+    # If not enough connections, try to create new ones
+    while len(acquired) < num_needed and conn_config:
+        try:
+            new_conn = connect_with_retries(conn_config)
+            acquired.append(PooledConnection(new_conn))
+            logging.info("Created new connection to meet required pool size")
+        except Exception as e:
+            logging.error(f"Failed to create new connection: {e}")
+            break
     return acquired
 
 def get_timezone(global_config, conn_config):
@@ -431,7 +482,7 @@ def metrics():
         # Acquire connections, blocking if necessary
         with pool_lock:
             num_to_acquire = min(exporter_max_conn, pool_size)
-            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire)
+            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, conn_config=conn_config, max_lifetime=max_lifetime)
             temp_pool = Queue(maxsize=num_to_acquire)
             for conn in acquired_conns:
                 temp_pool.put(conn)
