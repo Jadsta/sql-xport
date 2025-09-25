@@ -467,13 +467,11 @@ def metrics():
 # --- Pre-populate connection pools at startup ---
 def initialize_connection_pools():
     try:
-        # Find all exporter configs in subfolders
-        for exporter_folder in Path(__file__).parent.glob('*/sql_exporter.yml'):
-            exporter_name = exporter_folder.parent.name
-            config, _ = load_sql_exporter_config(exporter_name)
-            data_source_name = config['target']['data_source_name']
-            settings_path = Path(__file__).parent / 'settings.yml'
-            conn_config = get_connection_config_from_settings(data_source_name, settings_path)
+        # Load all data sources from settings.yml
+        settings_path = Path(__file__).parent / 'settings.yml'
+        settings = load_settings(settings_path)
+        data_sources = settings.get('data_sources', {})
+        for data_source_name, conn_config in data_sources.items():
             pool_size = conn_config.get('max_connections', 1)
             connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
             # Pre-populate pool with live connections
