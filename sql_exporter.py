@@ -198,6 +198,20 @@ def connect_with_retries(conn_config):
         logging.error(f"All connection attempts failed, but no exception was captured. DSN: {dsn}, config: {conn_config}")
         raise Exception("Unknown connection error: no exception captured during retries")
 
+def is_connection_alive(conn):
+    """
+    Checks if the Teradata connection is alive by running a lightweight query.
+    Returns True if alive, False otherwise.
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchall()
+        return True
+    except Exception as e:
+        logging.warning(f"Connection health check failed: {e}")
+        return False
+
 def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, conn_config=None):
     import datetime
     import time
@@ -218,7 +232,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 candidate = connection_pool.get()
                 logging.info(f"[DEBUG] Checking pooled connection: {candidate.conn}")
                 if candidate.is_expired(max_lifetime):
-                    logging.info("Discarding expired connection")
+                    logging.info("Discarding expired connection (expired)")
+                    candidate.conn.close()
+                elif not is_connection_alive(candidate.conn):
+                    logging.info("Discarding expired connection (not alive)")
                     candidate.conn.close()
                 else:
                     conn_wrapper = candidate
