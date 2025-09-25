@@ -77,6 +77,34 @@ timeout = 60
 keepalive = 2
 ```
 
+## Requirements
+
+To run the SQL exporter, ensure the following Python packages are installed:
+
+- Flask
+- PyYAML
+- teradatasql
+- pytz
+- tzlocal
+
+You can install all requirements with:
+
+```sh
+pip install Flask PyYAML teradatasql pytz tzlocal
+```
+
+### Additional Notes
+- The exporter requires Python 3.7 or newer.
+- All dependencies must be installed in the environment where you run the exporter (including Gunicorn, if used for production).
+- If you use Gunicorn, install it separately:
+  ```sh
+  pip install gunicorn
+  ```
+- For Windows, you may need to use `waitress` instead of Gunicorn:
+  ```sh
+  pip install waitress
+  ```
+
 ## Running the Exporter
 1. Install dependencies:
    ```pwsh
