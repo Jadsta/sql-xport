@@ -13,6 +13,7 @@ import queue
 import pytz
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import traceback                # For detailed error logging
 
 
 
@@ -432,9 +433,11 @@ def initialize_connection_pools():
                         connection_pool.put(PooledConnection(conn))
                         logging.info(f"Pre-populated connection for data source '{data_source_name}'")
                     except Exception as e:
-                        logging.error(f"Failed to pre-populate connection for '{data_source_name}': {e}")
+                        tb = traceback.format_exc()
+                        logging.error(f"Failed to pre-populate connection for '{data_source_name}': {e}\n{tb}")
     except Exception as e:
-        logging.error(f"Error initializing connection pools: {e}")
+        tb = traceback.format_exc()
+        logging.error(f"Error initializing connection pools: {e}\n{tb}")
 
 # Call this at startup
 initialize_connection_pools()
