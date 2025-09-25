@@ -206,23 +206,32 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
 
     conn_wrapper = None
     try:
-        # Try to reuse a connection
-        while not connection_pool.empty():
-            candidate = connection_pool.get()
-            if candidate.is_expired(max_lifetime):
-                logging.info("Discarding expired connection")
-                candidate.conn.close()
-            else:
-                conn_wrapper = candidate
-                break
-
-        # Create new if none available
-        if conn_wrapper is None:
-            logging.info("Opening new DB connection with retries")
+        # --- DEBUG: Option to force new connection for each scrape ---
+        force_new_connection = conn_config.get('force_new_connection', False) if conn_config else False
+        if force_new_connection:
+            logging.info("[DEBUG] Forcing new connection for this scrape (pool bypassed)")
             conn = connect_with_retries(conn_config or {})
             conn_wrapper = PooledConnection(conn)
+        else:
+            # Try to reuse a connection
+            while not connection_pool.empty():
+                candidate = connection_pool.get()
+                logging.info(f"[DEBUG] Checking pooled connection: {candidate.conn}")
+                if candidate.is_expired(max_lifetime):
+                    logging.info("Discarding expired connection")
+                    candidate.conn.close()
+                else:
+                    conn_wrapper = candidate
+                    break
+            # Create new if none available
+            if conn_wrapper is None:
+                logging.info("Opening new DB connection with retries")
+                conn = connect_with_retries(conn_config or {})
+                conn_wrapper = PooledConnection(conn)
 
+        logging.info(f"[DEBUG] Connection object: {conn_wrapper.conn}")
         cursor = conn_wrapper.conn.cursor()
+        logging.info(f"[DEBUG] Cursor object: {cursor}")
         metric_blocks = defaultdict(list)
 
         for query_def in queries:
@@ -235,7 +244,13 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             metric_blocks[metric_name].append(f"# TYPE {metric_name} {metric_type}")
 
             logging.info(f"Executing query: {query_def['sql']}")
-            cursor.execute(query_def['sql'])
+            logging.info(f"[DEBUG] Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
+            try:
+                cursor.execute(query_def['sql'])
+            except Exception as e:
+                tb = traceback.format_exc()
+                logging.error(f"[ERROR] Query execution failed for metric '{metric_name}': {e}\nTraceback:\n{tb}")
+                raise
 
             for row in cursor.fetchall():
                 logging.debug(f"Query result row: {row}")
@@ -289,10 +304,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 metric_blocks[metric_name].append(metric_line)
 
         # Return to pool if under idle limit
-        if connection_pool.qsize() < max_idle:
+        if not force_new_connection and connection_pool.qsize() < max_idle:
             connection_pool.put(conn_wrapper)
         else:
-            logging.info("Idle pool full, closing connection")
+            logging.info("Idle pool full or forced new connection, closing connection")
             conn_wrapper.conn.close()
 
         # Sort metrics alphabetically by metric name
@@ -301,10 +316,12 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             sorted_output.extend(metric_blocks[metric_name])
 
         return sorted_output
-
     except Exception as e:
         if conn_wrapper:
-            conn_wrapper.conn.close()
+            try:
+                conn_wrapper.conn.close()
+            except Exception as close_exc:
+                logging.error(f"[ERROR] Failed to close connection after error: {close_exc}")
         raise e
 
 def load_settings(settings_path):
