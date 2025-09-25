@@ -179,7 +179,12 @@ def connect_with_retries(conn_config):
             logging.warning(f"Connection attempt {attempt} failed: {exc}")
             if attempt < retries:
                 time.sleep(delay)
-    raise last_exc
+    if last_exc is not None:
+        logging.error(f"All connection attempts failed. Last error: {last_exc}")
+        raise last_exc
+    else:
+        logging.error("All connection attempts failed, but no exception was captured.")
+        raise Exception("Unknown connection error: no exception captured during retries")
 
 def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, conn_config=None):
     import datetime
