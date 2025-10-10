@@ -82,9 +82,7 @@ def build_dsn(conn_config):
     for key in ["logmech", "connect_timeout"]:
         if key in conn_config:
             dsn[key] = conn_config[key]
-    # Set queryBand if query_band is present in config
-    if "query_band" in conn_config:
-        dsn["queryBand"] = conn_config["query_band"]
+    # Do NOT set queryBand here; it is set after connection
     return dsn
 
 def resolve_collectors(config, base_dir):
