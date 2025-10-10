@@ -10,6 +10,7 @@ data_sources:
     connect_timeout: 10    # Timeout (seconds) for establishing a connection
     idle_timeout: 300      # How long (seconds) an idle connection stays in the pool before being closed
     logmech: "TD2"        # Example: Teradata logon mechanism
+    query_band: "app=py_sql_exporter;env=prod;"  # Example query band for this data source
     # Add other connection settings as needed
   teradata_backup:
     host: "your-backup-host"
@@ -23,3 +24,4 @@ data_sources:
     idle_timeout: 300
     logmech: "TD2"
     # Add other connection settings as needed
+# Note: query_band is set per data source and only used for that connection.
