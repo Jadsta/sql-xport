@@ -184,6 +184,15 @@ def connect_with_retries(conn_config):
                 dsn['connect_timeout'] = connect_timeout
             logging.info(f"Connection attempt {attempt} DSN: {dsn}")
             conn = teradatasql.connect(**dsn)
+            # Set query band for session if present
+            if "query_band" in conn_config:
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(f"SET QUERY_BAND = '{conn_config['query_band']}' FOR SESSION;")
+                    cursor.close()
+                    logging.info(f"Set query band for session: {conn_config['query_band']}")
+                except Exception as qb_exc:
+                    logging.warning(f"Failed to set query band: {qb_exc}")
             elapsed = time.time() - start_time
             logging.info(f"Connection attempt {attempt} succeeded in {elapsed:.2f} seconds.")
             return conn
