@@ -219,21 +219,31 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
     logging.info("Acquiring DB connection(s) for parallel query execution...")
 
+    # Group metrics by their SQL query
+    query_to_metrics = defaultdict(list)
+    for q in queries:
+        query_to_metrics[q['sql']].append(q)
+
+    query_defs = []
+    for sql, metrics in query_to_metrics.items():
+        # Use the first metric as a template for connection/query config
+        query_def = metrics[0].copy()
+        query_def['metrics'] = metrics
+        query_defs.append(query_def)
+
     query_retries = (conn_config or {}).get('query_retries', 1)
     query_retry_delay = (conn_config or {}).get('query_retry_delay', 1)
     force_new_connection = conn_config.get('force_new_connection', False) if conn_config else False
-    num_queries = len(queries)
+    num_queries = len(query_defs)
     max_workers = min(num_queries, conn_config.get('max_connections', 1) if conn_config else 1)
 
     def execute_query(query_def):
         conn_wrapper = None
         try:
-            # Always use a new connection for each query if force_new_connection, else try pool
             if force_new_connection:
                 conn = connect_with_retries(conn_config or {})
                 conn_wrapper = PooledConnection(conn)
             else:
-                # Try to reuse a connection from the temp pool
                 if not connection_pool.empty():
                     candidate = connection_pool.get()
                     if candidate.is_expired(max_lifetime) or not is_connection_alive(candidate.conn):
@@ -249,21 +259,20 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     conn = connect_with_retries(conn_config or {})
                     conn_wrapper = PooledConnection(conn)
 
-            metric_name = query_def['metric_name']
-            help_text = query_def.get('help', '')
-            metric_type = query_def.get('type', 'gauge')
-            metric_lines = [f"# HELP {metric_name} {help_text}", f"# TYPE {metric_name} {metric_type}"]
+            sql = query_def['sql']
+            metrics = query_def['metrics']
+            metric_lines = []
             attempt = 0
             while attempt < query_retries:
                 try:
                     cursor = conn_wrapper.conn.cursor()
                     logging.info(f"[DEBUG] Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
-                    cursor.execute(query_def['sql'])
+                    cursor.execute(sql)
                     rows = cursor.fetchall()
                     break  # Success
                 except Exception as e:
                     tb = traceback.format_exc()
-                    logging.error(f"[ERROR] Query execution failed for metric '{metric_name}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
+                    logging.error(f"[ERROR] Query execution failed for SQL '{sql}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
                     if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower():
                         try:
                             conn_wrapper.conn.close()
@@ -280,46 +289,53 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             else:
                 raise Exception(f"Query failed after {query_retries} retries due to lost connection.")
 
-            for row in rows:
-                labels = []
-                for label in query_def.get('labels', []):
-                    try:
-                        i = next(idx for idx, col in enumerate(cursor.description) if col[0].lower() == label.lower())
-                        labels.append(f'{label}="{row[i]}"')
-                    except StopIteration:
-                        logging.warning(f"Label column '{label}' not found in result set for metric {metric_name}")
-                for k, v in query_def.get('static_labels', {}).items():
-                    labels.append(f'{k}="{v}"')
-                value = query_def.get('static_value', None)
-                if value is None and query_def.get('values'):
-                    value_column = query_def['values'][0]
-                    try:
-                        value_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == value_column.lower())
-                        raw_value = row[value_index]
-                        value = format_value(raw_value)
-                    except Exception as e:
-                        logging.warning(f"Could not resolve value column '{value_column}' for metric {metric_name}: {e}")
-                        value = "0"
-                else:
-                    value = format_value(value)
-                timestamp = ""
-                ts_col = query_def.get('timestamp_value')
-                if ts_col:
-                    try:
-                        ts_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == ts_col.lower())
-                        ts_raw = row[ts_index]
-                        if isinstance(ts_raw, datetime.datetime):
-                            if ts_raw.tzinfo is None:
-                                ts_raw = tz.localize(ts_raw)
-                            timestamp = f" {int(ts_raw.timestamp() * 1000)}"
-                        elif isinstance(ts_raw, datetime.date):
-                            dt = datetime.datetime.combine(ts_raw, datetime.time())
-                            dt = tz.localize(dt)
-                            timestamp = f" {int(dt.timestamp() * 1000)}"
-                    except Exception as e:
-                        logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
-                metric_line = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
-                metric_lines.append(metric_line)
+            # For each metric referencing this query, process the result set
+            for metric in metrics:
+                metric_name = metric['metric_name']
+                help_text = metric.get('help', '')
+                metric_type = metric.get('type', 'gauge')
+                metric_lines.append(f"# HELP {metric_name} {help_text}")
+                metric_lines.append(f"# TYPE {metric_name} {metric_type}")
+                for row in rows:
+                    labels = []
+                    for label in metric.get('labels', []):
+                        try:
+                            i = next(idx for idx, col in enumerate(cursor.description) if col[0].lower() == label.lower())
+                            labels.append(f'{label}="{row[i]}"')
+                        except StopIteration:
+                            logging.warning(f"Label column '{label}' not found in result set for metric {metric_name}")
+                    for k, v in metric.get('static_labels', {}).items():
+                        labels.append(f'{k}="{v}"')
+                    value = metric.get('static_value', None)
+                    if value is None and metric.get('values'):
+                        value_column = metric['values'][0]
+                        try:
+                            value_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == value_column.lower())
+                            raw_value = row[value_index]
+                            value = format_value(raw_value)
+                        except Exception as e:
+                            logging.warning(f"Could not resolve value column '{value_column}' for metric {metric_name}: {e}")
+                            value = "0"
+                    else:
+                        value = format_value(value)
+                    timestamp = ""
+                    ts_col = metric.get('timestamp_value')
+                    if ts_col:
+                        try:
+                            ts_index = next(i for i, col in enumerate(cursor.description) if col[0].lower() == ts_col.lower())
+                            ts_raw = row[ts_index]
+                            if isinstance(ts_raw, datetime.datetime):
+                                if ts_raw.tzinfo is None:
+                                    ts_raw = tz.localize(ts_raw)
+                                timestamp = f" {int(ts_raw.timestamp() * 1000)}"
+                            elif isinstance(ts_raw, datetime.date):
+                                dt = datetime.datetime.combine(ts_raw, datetime.time())
+                                dt = tz.localize(dt)
+                                timestamp = f" {int(dt.timestamp() * 1000)}"
+                        except Exception as e:
+                            logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
+                    metric_line = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
+                    metric_lines.append(metric_line)
             # Return connection to pool if not forced new
             if not force_new_connection and connection_pool.qsize() < max_idle:
                 connection_pool.put(conn_wrapper)
@@ -341,29 +357,30 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
     results = {}
     errors = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_query = {executor.submit(execute_query, q): q for q in queries}
+        future_to_query = {executor.submit(execute_query, q): q for q in query_defs}
         try:
             for future in as_completed(future_to_query, timeout=conn_config.get('scrape_timeout_offset', 0) or None):
                 query_def = future_to_query[future]
-                metric_name = query_def['metric_name']
+                # Each query_def may produce multiple metrics
                 try:
                     metric_lines = future.result()
-                    metric_blocks[metric_name].extend(metric_lines)
-                    results[metric_name] = True
+                    for line in metric_lines:
+                        metric_blocks[query_def['sql']].append(line)
+                    results[query_def['sql']] = True
                 except Exception as e:
-                    logging.error(f"Error running query for metric '{metric_name}': {e}")
-                    errors[metric_name] = str(e)
+                    logging.error(f"Error running query for SQL '{query_def['sql']}': {e}")
+                    errors[query_def['sql']] = str(e)
         except TimeoutError:
             logging.error("Partial scrape: scrape_timeout reached, returning partial results.")
             # Any futures not completed will be missing from results/errors
     # Add error metrics for failed queries
-    for metric_name in errors:
-        metric_blocks[metric_name].append(f'up{{metric="{metric_name}"}} 0')
-        metric_blocks[metric_name].append(f'error{{metric="{metric_name}",message="{errors[metric_name]}"}} 1')
+    for sql in errors:
+        metric_blocks[sql].append(f'up{{query="{sql}"}} 0')
+        metric_blocks[sql].append(f'error{{query="{sql}",message="{errors[sql]}"}} 1')
     # Sort metrics alphabetically by metric name
     sorted_output = []
-    for metric_name in sorted(metric_blocks.keys()):
-        sorted_output.extend(metric_blocks[metric_name])
+    for sql in sorted(metric_blocks.keys()):
+        sorted_output.extend(metric_blocks[sql])
     return sorted_output
 
 def load_settings(settings_path):
