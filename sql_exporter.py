@@ -79,7 +79,6 @@ def load_sql_exporter_config(exporter_name):
     return config, config_path.parent
 
 def build_dsn(conn_config):
-    logging.debug(f"Building DSN from connection config: {conn_config}")
     dsn = {
         "host": conn_config["host"],
         "user": conn_config["user"],
@@ -90,6 +89,11 @@ def build_dsn(conn_config):
         if key in conn_config:
             dsn[key] = conn_config[key]
     # Do NOT set queryBand here; it is set after connection
+    # Mask password for logging
+    dsn_log = dict(dsn)
+    if 'password' in dsn_log:
+        dsn_log['password'] = '***'
+    logging.debug(f"Building DSN from connection config: {dsn_log}")
     return dsn
 
 def resolve_collectors(config, base_dir):
@@ -568,8 +572,8 @@ def metrics():
             metrics_output.append(f'up{{target="{target_name}"}} 1')
             metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
-        # Log metrics if enabled
-        log_metrics = global_config.get('log_scraped_metrics', False)
+        # Log metrics if enabled (from settings.yml)
+        log_metrics = settings.get('global', {}).get('log_scraped_metrics', False)
         if log_metrics:
             log_time = datetime.datetime.now().isoformat()
             logging.info(f"--- Metrics scrape at {log_time} ---\n" + "\n".join(metrics_output) + "\n--- End scrape ---")
