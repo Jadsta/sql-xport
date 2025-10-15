@@ -359,7 +359,9 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                                 timestamp = f" {int(dt.timestamp() * 1000)}"
                         except Exception as e:
                             logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
-                    metric_line = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
+                    # Sort labels alphabetically by label name
+                    labels_sorted = sorted(labels, key=lambda x: x.split('=')[0])
+                    metric_line = f"{metric_name}{{{','.join(labels_sorted)}}} {value}{timestamp}"
                     metric_samples[metric_name].append(metric_line)
             # Return connection to pool if not forced new
             if not force_new_connection and connection_pool.qsize() < max_idle:
