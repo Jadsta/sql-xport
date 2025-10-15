@@ -20,8 +20,15 @@ RUN chown -R tdmon:tdmon /home/tdmon/app
 # Switch to tdmon user
 USER tdmon
 
-# Install Python dependencies
-RUN pip3 install --user Flask PyYAML teradatasql pytz tzlocal gunicorn waitress
+# Install Python dependencies and clean up
+RUN pip3 install --user --no-cache-dir Flask PyYAML teradatasql pytz tzlocal gunicorn waitress && \
+    find /home/tdmon/app -type d -name "__pycache__" -exec rm -rf {} + && \
+    find /home/tdmon/app -type f -name "*.pyc" -delete
+
+# Remove build tools if not needed at runtime
+USER root
+RUN yum -y remove gcc make && yum clean all
+USER tdmon
 
 # Expose default Gunicorn port
 EXPOSE 8000

@@ -181,13 +181,17 @@ def connect_with_retries(conn_config):
     dsn = build_dsn(conn_config)
     last_exc = None
     for attempt in range(1, retries + 1):
-        logging.debug(f"Attempt {attempt}: Trying to connect with DSN: {dsn} and config: {conn_config}")
+        # Mask password in DSN for logging
+        dsn_log = dict(dsn)
+        if 'password' in dsn_log:
+            dsn_log['password'] = '***'
+        logging.debug(f"Attempt {attempt}: Trying to connect with DSN: {dsn_log} and config: [password hidden]")
         start_time = time.time()
         try:
             # Pass connect_timeout if supported by teradatasql
             if connect_timeout is not None:
                 dsn['connect_timeout'] = connect_timeout
-            logging.info(f"Connection attempt {attempt} DSN: {dsn}")
+            logging.info(f"Connection attempt {attempt} DSN: {dsn_log}")
             conn = teradatasql.connect(**dsn)
             # Set query band for session if present
             if "query_band" in conn_config:
@@ -212,7 +216,7 @@ def connect_with_retries(conn_config):
         logging.error(f"All connection attempts failed. Last error: {last_exc}\nTraceback:\n{traceback.format_exc()}")
         raise last_exc
     else:
-        logging.error(f"All connection attempts failed, but no exception was captured. DSN: {dsn}, config: {conn_config}")
+        logging.error(f"All connection attempts failed, but no exception was captured. DSN: {dsn_log}, config: [password hidden]")
         raise Exception("Unknown connection error: no exception captured during retries")
 
 def is_connection_alive(conn):
@@ -583,6 +587,14 @@ def initialize_connection_pools():
         # Load all data sources from settings.yml
         settings_path = Path(__file__).parent / 'settings.yml'
         settings = load_settings(settings_path)
+        # Log global settings, hide passwords
+        settings_to_log = yaml.safe_load(yaml.dump(settings))
+        for ds in settings_to_log.get('data_sources', {}).values():
+            if 'password' in ds:
+                ds['password'] = '***'
+        log_metrics = settings_to_log.get('global', {}).get('log_scraped_metrics', False)
+        logging.info(f"Loaded settings.yml (passwords hidden): {settings_to_log}")
+        logging.info(f"log_scraped_metrics enabled: {log_metrics}")
         data_sources = settings.get('data_sources', {})
         for data_source_name, conn_config in data_sources.items():
             pool_size = conn_config.get('max_connections', 1)
