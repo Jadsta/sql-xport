@@ -402,14 +402,15 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
     for sql in errors:
         all_metric_samples[f'up_error_{sql}'].append(f'up{{query="{sql}"}} 0')
         all_metric_samples[f'up_error_{sql}'].append(f'error{{query="{sql}",message="{errors[sql]}"}} 1')
-    # Output metrics grouped by metric_name
+    # Output metrics grouped by metric_name, with samples sorted alphabetically
     sorted_output = []
     for mname in sorted(all_metric_samples.keys()):
         if mname in all_metric_meta:
             help_text, metric_type = all_metric_meta[mname]
             sorted_output.append(f"# HELP {mname} {help_text}")
             sorted_output.append(f"# TYPE {mname} {metric_type}")
-        sorted_output.extend(all_metric_samples[mname])
+        # Sort samples for this metric_name
+        sorted_output.extend(sorted(all_metric_samples[mname]))
     return sorted_output
 
 def load_settings(settings_path):
