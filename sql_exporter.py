@@ -68,7 +68,14 @@ def load_sql_exporter_config(exporter_name):
     with config_path.open() as f:
         config = yaml.safe_load(f)
 
-    logging.debug(f"Loaded config: {config}")
+    # Exclude password from logging
+    config_to_log = yaml.safe_load(yaml.dump(config))
+    for ds in config_to_log.get('data_sources', {}).values():
+        if 'password' in ds:
+            ds['password'] = '***'
+    log_metrics = config_to_log.get('global', {}).get('log_scraped_metrics', False)
+    logging.info(f"Loaded config: {config_to_log}")
+    logging.info(f"log_scraped_metrics enabled: {log_metrics}")
     return config, config_path.parent
 
 def build_dsn(conn_config):
