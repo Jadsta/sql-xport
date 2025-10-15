@@ -286,7 +286,8 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
 
             sql = query_def['sql']
             metrics = query_def['metrics']
-            metric_lines = []
+            metric_samples = defaultdict(list)
+            metric_meta = {}
             attempt = 0
             while attempt < query_retries:
                 try:
@@ -319,8 +320,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 metric_name = metric['metric_name']
                 help_text = metric.get('help', '')
                 metric_type = metric.get('type', 'gauge')
-                metric_lines.append(f"# HELP {metric_name} {help_text}")
-                metric_lines.append(f"# TYPE {metric_name} {metric_type}")
+                metric_meta[metric_name] = (help_text, metric_type)
                 for row in rows:
                     labels = []
                     for label in metric.get('labels', []):
@@ -360,7 +360,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                         except Exception as e:
                             logging.warning(f"Could not extract timestamp for {metric_name}: {e}")
                     metric_line = f"{metric_name}{{{','.join(labels)}}} {value}{timestamp}"
-                    metric_lines.append(metric_line)
+                    metric_samples[metric_name].append(metric_line)
             # Return connection to pool if not forced new
             if not force_new_connection and connection_pool.qsize() < max_idle:
                 connection_pool.put(conn_wrapper)
@@ -369,7 +369,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     conn_wrapper.conn.close()
                 except Exception:
                     pass
-            return metric_lines
+            return metric_meta, metric_samples
         except Exception as e:
             if conn_wrapper:
                 try:
@@ -378,34 +378,38 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     logging.error(f"[ERROR] Failed to close connection after error: {close_exc}")
             raise e
 
-    metric_blocks = defaultdict(list)
-    results = {}
+    # Collect all metric samples and meta from all queries
+    all_metric_meta = {}
+    all_metric_samples = defaultdict(list)
     errors = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_query = {executor.submit(execute_query, q): q for q in query_defs}
         try:
             for future in as_completed(future_to_query, timeout=conn_config.get('scrape_timeout_offset', 0) or None):
                 query_def = future_to_query[future]
-                # Each query_def may produce multiple metrics
                 try:
-                    metric_lines = future.result()
-                    for line in metric_lines:
-                        metric_blocks[query_def['sql']].append(line)
-                    results[query_def['sql']] = True
+                    metric_meta, metric_samples = future.result()
+                    for mname, meta in metric_meta.items():
+                        all_metric_meta[mname] = meta
+                    for mname, samples in metric_samples.items():
+                        all_metric_samples[mname].extend(samples)
                 except Exception as e:
                     logging.error(f"Error running query for SQL '{query_def['sql']}': {e}")
                     errors[query_def['sql']] = str(e)
         except TimeoutError:
             logging.error("Partial scrape: scrape_timeout reached, returning partial results.")
-            # Any futures not completed will be missing from results/errors
     # Add error metrics for failed queries
     for sql in errors:
-        metric_blocks[sql].append(f'up{{query="{sql}"}} 0')
-        metric_blocks[sql].append(f'error{{query="{sql}",message="{errors[sql]}"}} 1')
-    # Sort metrics alphabetically by metric name
+        all_metric_samples[f'up_error_{sql}'].append(f'up{{query="{sql}"}} 0')
+        all_metric_samples[f'up_error_{sql}'].append(f'error{{query="{sql}",message="{errors[sql]}"}} 1')
+    # Output metrics grouped by metric_name
     sorted_output = []
-    for sql in sorted(metric_blocks.keys()):
-        sorted_output.extend(metric_blocks[sql])
+    for mname in sorted(all_metric_samples.keys()):
+        if mname in all_metric_meta:
+            help_text, metric_type = all_metric_meta[mname]
+            sorted_output.append(f"# HELP {mname} {help_text}")
+            sorted_output.append(f"# TYPE {mname} {metric_type}")
+        sorted_output.extend(all_metric_samples[mname])
     return sorted_output
 
 def load_settings(settings_path):
