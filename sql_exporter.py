@@ -557,6 +557,12 @@ def metrics():
             metrics_output.append(f'up{{target="{target_name}"}} 1')
             metrics_output.append(f'scrape_duration_seconds{{target="{target_name}"}} {duration:.3f}')
 
+        # Log metrics if enabled
+        log_metrics = global_config.get('log_scraped_metrics', False)
+        if log_metrics:
+            log_time = datetime.datetime.now().isoformat()
+            logging.info(f"--- Metrics scrape at {log_time} ---\n" + "\n".join(metrics_output) + "\n--- End scrape ---")
+
         logging.info(f"Scrape completed in {duration:.3f} seconds")
         return Response("\n".join(metrics_output), mimetype='text/plain')
 

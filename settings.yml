@@ -1,3 +1,7 @@
+global:
+  log_scraped_metrics: true  # Set to true to log all scraped metrics with timestamp
+  # ...other global settings...
+
 data_sources:
   teradata_main:
     host: "your-teradata-host"
