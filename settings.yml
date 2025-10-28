@@ -6,7 +6,12 @@ data_sources:
   teradata_main:
     host: "your-teradata-host"
     user: "your-user"
-    password: "your-password"
+    # Use Teradata Stored Password Protection files. The exporter will pass
+    # the ENCRYPTED_PASSWORD(...) syntax to the teradatasql driver and the
+    # driver will decrypt the password at connect time.
+    password_encrypted:
+      - "/connections/PassKey.properties"
+      - "/connections/EncPass.properties"
     max_connections: 8  # Maximum pool size for this data source
     timezone: "Australia/Sydney"  # Example: AEST timezone
     connection_retries: 3  # Number of times to retry connecting if initial attempt fails
