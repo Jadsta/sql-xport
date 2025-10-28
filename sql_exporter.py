@@ -269,9 +269,15 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 conn = connect_with_retries(conn_config or {})
                 conn_wrapper = PooledConnection(conn)
             else:
-                if not connection_pool.empty():
-                    candidate = connection_pool.get()
+                # Prefer taking an existing pooled connection without blocking; if none available, create a new one
+                try:
+                    candidate = connection_pool.get_nowait()
+                except queue.Empty:
+                    candidate = None
+
+                if candidate:
                     if candidate.is_expired(max_lifetime) or not is_connection_alive(candidate.conn):
+                        logging.info(f"Discarding pooled connection (expired/failed health check)")
                         try:
                             candidate.conn.close()
                         except Exception:
@@ -281,6 +287,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     else:
                         conn_wrapper = candidate
                 else:
+                    # No immediate pooled connection available; create a fresh one
                     conn = connect_with_retries(conn_config or {})
                     conn_wrapper = PooledConnection(conn)
 
@@ -363,9 +370,16 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     labels_sorted = sorted(labels, key=lambda x: x.split('=')[0])
                     metric_line = f"{metric_name}{{{','.join(labels_sorted)}}} {value}{timestamp}"
                     metric_samples[metric_name].append(metric_line)
-            # Return connection to pool if not forced new
-            if not force_new_connection and connection_pool.qsize() < max_idle:
-                connection_pool.put(conn_wrapper)
+            # Return connection to pool if not forced new. Use non-blocking put to avoid deadlocks.
+            if not force_new_connection:
+                try:
+                    connection_pool.put_nowait(conn_wrapper)
+                except queue.Full:
+                    # Pool full: close extra connection rather than blocking
+                    try:
+                        conn_wrapper.conn.close()
+                    except Exception:
+                        pass
             else:
                 try:
                     conn_wrapper.conn.close()
@@ -552,12 +566,19 @@ def metrics():
         queries = load_queries_from_collectors(matched_collectors)
         tz = get_timezone(global_config, conn_config)
 
-        with pool_lock:
-            num_to_acquire = min(exporter_max_conn, pool_size)
-            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, conn_config=conn_config, max_lifetime=max_lifetime)
-            temp_pool = Queue(maxsize=num_to_acquire)
-            for conn in acquired_conns:
-                temp_pool.put(conn)
+        # Acquire connections WITHOUT holding the pool lock to avoid blocking other request threads
+        num_to_acquire = min(exporter_max_conn, pool_size)
+        acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, conn_config=conn_config, max_lifetime=max_lifetime)
+        temp_pool = Queue(maxsize=max(1, num_to_acquire))
+        for conn in acquired_conns:
+            try:
+                temp_pool.put_nowait(conn)
+            except queue.Full:
+                # If temp_pool somehow is full, close the extra connection to avoid blocking
+                try:
+                    conn.conn.close()
+                except Exception:
+                    pass
 
         # Enforce scrape timeout using effective_timeout
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -568,9 +589,18 @@ def metrics():
                 logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
                 return Response(f'up{{target="unknown"}} 0\nerror{{message="scrape_timeout"}} 1', mimetype='text/plain', status=504)
 
+        # Return temp_pool connections back to the global pool. Use lock to protect queue operations but avoid blocking puts.
         with pool_lock:
             while not temp_pool.empty():
-                connection_pool.put(temp_pool.get())
+                conn_wrapper = temp_pool.get()
+                try:
+                    connection_pool.put_nowait(conn_wrapper)
+                except queue.Full:
+                    # If global pool is full, close the connection instead of blocking
+                    try:
+                        conn_wrapper.conn.close()
+                    except Exception:
+                        pass
 
         duration = time.time() - start
         target_name = config['target'].get('name')
