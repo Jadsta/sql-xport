@@ -108,17 +108,26 @@ def resolve_collectors(config, base_dir):
     matched_collectors = []
     available_collectors = []  # list of (collector_name, file_path)
     for file_path in collector_files:
-        with open(file_path) as f:
-            collector = yaml.safe_load(f)
-            collector_name = collector.get('collector_name')
-            logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
-            if collector_name:
-                available_collectors.append((collector_name, file_path))
-                if any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
-                    matched_collectors.append((collector_name, collector))
+        try:
+            with open(file_path) as f:
+                collector = yaml.safe_load(f)
+        except Exception as e:
+            logging.warning(f"Failed to parse collector file '{file_path}': {e}")
+            # record that the file existed but couldn't be parsed
+            available_collectors.append((f"<<parse_error>>", file_path))
+            continue
+        collector_name = collector.get('collector_name') if isinstance(collector, dict) else None
+        logging.info(f"Evaluating collector '{collector_name}' from file: {file_path}")
+        if collector_name:
+            available_collectors.append((collector_name, file_path))
+            if any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
+                matched_collectors.append((collector_name, collector))
 
-    logging.info(f"Matched collectors: {[name for name, _ in matched_collectors]}")
-    logging.debug(f"Available collectors: {available_collectors}")
+    matched_names = [name for name, _ in matched_collectors]
+    available_names = [name for name, _ in available_collectors]
+    logging.info(f"Matched collectors: {matched_names}")
+    # Log available collector names at INFO so it's visible in standard logs
+    logging.info(f"Available collectors: {available_names}")
     return matched_collectors, available_collectors
 
 def resolve_queries_from_metrics(collector):
@@ -564,8 +573,9 @@ def metrics():
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
         matched_collectors, available_collectors = resolve_collectors(config, base_dir)
-        logging.debug(f"Post-resolve: matched_collectors type={type(matched_collectors)} repr={matched_collectors}")
-        logging.debug(f"Post-resolve: available_collectors type={type(available_collectors)} repr={available_collectors}")
+        # Log compact information about resolved collectors
+        logging.info(f"Post-resolve: matched_collectors={ [name for name,_ in matched_collectors] }")
+        logging.info(f"Post-resolve: available_collectors={ [name for name,_ in available_collectors] }")
         # Validate that requested collectors actually exist
         requested_collectors = config['target'].get('collectors', [])
         if len(matched_collectors) == 0:
