@@ -34,4 +34,4 @@ USER tdmon
 EXPOSE 8000
 
 # Entrypoint for Gunicorn
-CMD ["/usr/bin/python3", "-m", "gunicorn", "-c", "gunicorn_config.py", "--threads", "1", "sql_exporter:app"]
+CMD ["/usr/bin/python3", "-m", "gunicorn", "-c", "gunicorn_config.py", "sql_exporter:app"]

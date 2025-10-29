@@ -14,6 +14,10 @@ import pytz
 import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import traceback                # For detailed error logging
+try:
+    import tzlocal
+except Exception:
+    tzlocal = None
 
 
 
@@ -23,6 +27,43 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+
+class TZFormatter(logging.Formatter):
+    """Logging formatter that renders times in a given tzinfo (pytz).
+
+    Usage: set handler.setFormatter(TZFormatter(fmt, datefmt, tz=tzobj))
+    """
+    def __init__(self, fmt=None, datefmt=None, tz=None):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.tz = tz
+
+    def formatTime(self, record, datefmt=None):
+        # record.created is a POSIX timestamp
+        try:
+            if self.tz is not None:
+                dt = datetime.datetime.fromtimestamp(record.created, tz=self.tz)
+            else:
+                dt = datetime.datetime.fromtimestamp(record.created, tz=datetime.timezone.utc)
+        except Exception:
+            dt = datetime.datetime.fromtimestamp(record.created)
+
+        if datefmt:
+            return dt.strftime(datefmt)
+        # Default ISO
+        return dt.isoformat()
+
+
+def apply_logging_timezone(tzinfo):
+    """Replace formatters on existing root handlers to use tzinfo for timestamps."""
+    fmt = '[%(asctime)s] %(levelname)s: %(message)s'
+    datefmt = '%Y-%m-%d %H:%M:%S'
+    for h in logging.root.handlers:
+        try:
+            h.setFormatter(TZFormatter(fmt=fmt, datefmt=datefmt, tz=tzinfo))
+        except Exception:
+            # fallback: ignore failures to set formatter
+            pass
 
 app = Flask(__name__)
 
@@ -653,6 +694,29 @@ def initialize_connection_pools():
         log_metrics = settings_to_log.get('global', {}).get('log_scraped_metrics', False)
         logging.info(f"Loaded settings.yml (passwords hidden): {settings_to_log}")
         logging.info(f"log_scraped_metrics enabled: {log_metrics}")
+        # Apply timezone from settings.yml to logging output so container logs use the desired timezone
+        tz_name = settings_to_log.get('global', {}).get('timezone', 'system')
+        tzinfo = None
+        try:
+            if tz_name == 'system':
+                if tzlocal:
+                    tzinfo = tzlocal.get_localzone()
+                else:
+                    tzinfo = datetime.timezone.utc
+            else:
+                try:
+                    tzinfo = pytz.timezone(tz_name)
+                except Exception:
+                    logging.warning(f"Invalid timezone '{tz_name}' in settings.yml; falling back to UTC")
+                    tzinfo = datetime.timezone.utc
+        except Exception as e:
+            logging.warning(f"Failed to resolve timezone '{tz_name}': {e}; falling back to UTC")
+            tzinfo = datetime.timezone.utc
+        try:
+            apply_logging_timezone(tzinfo)
+            logging.info(f"Applied logging timezone from settings.yml: {tz_name}")
+        except Exception:
+            logging.warning("Failed to apply timezone-aware logging formatter; continuing with default formatting")
         data_sources = settings.get('data_sources', {})
         for data_source_name, conn_config in data_sources.items():
             # Ensure pool_size is at least 1 when pre-populating
