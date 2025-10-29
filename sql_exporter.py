@@ -79,14 +79,10 @@ def load_sql_exporter_config(exporter_name):
     return config, config_path.parent
 
 def build_dsn(conn_config):
-    # Resolve password from a variety of supported sources (plain, file, command,
-    # or Teradata stored-password files). This keeps the DSN-building logic
-    # centralized and avoids embedding secret material in logs.
-    resolved_password = resolve_password(conn_config)
     dsn = {
         "host": conn_config["host"],
         "user": conn_config["user"],
-        "password": resolved_password
+        "password": conn_config.get("password")
     }
     # Include optional parameters if present
     for key in ["logmech", "connect_timeout"]:
@@ -99,77 +95,6 @@ def build_dsn(conn_config):
         dsn_log['password'] = '***'
     logging.debug(f"Building DSN from connection config: {dsn_log}")
     return dsn
-
-
-def resolve_password(conn_config):
-    """
-    Resolve the password for a connection. Supported options (in order):
-    - password: plain-text password
-    - password_file: path to file containing the password
-    - password_command: shell command to execute whose stdout is the password
-    - password_encrypted_key & password_encrypted_file: filenames for Teradata
-      Stored Password Protection. These will be returned as the ENCRYPTED_PASSWORD
-      string which the teradatasql driver understands and will decrypt at logon.
-
-    Returns a string to be passed as the 'password' connection parameter.
-    """
-    # 1) Direct password provided
-    if 'password' in conn_config and conn_config.get('password'):
-        return conn_config['password']
-
-    # 2) Password from a file
-    pf = conn_config.get('password_file')
-    if pf:
-        try:
-            with open(pf, 'r', encoding='utf-8') as f:
-                return f.read().strip()
-        except Exception as e:
-            logging.error(f"Failed to read password_file '{pf}': {e}")
-
-    # 3) Password from a command
-    pc = conn_config.get('password_command')
-    if pc:
-        try:
-            import subprocess
-            # Allow commands as strings; capture stdout as password
-            res = subprocess.run(pc, shell=True, capture_output=True, text=True)
-            if res.returncode == 0:
-                return res.stdout.strip()
-            else:
-                logging.error(f"password_command failed (rc={res.returncode}): {res.stderr}")
-        except Exception as e:
-            logging.error(f"Failed to run password_command '{pc}': {e}")
-
-    # 4) Teradata Stored Password Protection files
-    # Accept either two top-level keys password_encrypted_key & password_encrypted_file,
-    # or a dict password_encrypted with fields key_file and enc_file, or a list/tuple
-    # with two elements [key, enc]. We simply return the ENCRYPTED_PASSWORD(...) string
-    # which the teradatasql driver will process at connect time.
-    key = conn_config.get('password_encrypted_key')
-    enc = conn_config.get('password_encrypted_file')
-    if not (key and enc):
-        pe = conn_config.get('password_encrypted')
-        if isinstance(pe, (list, tuple)) and len(pe) >= 2:
-            key, enc = pe[0], pe[1]
-        elif isinstance(pe, dict):
-            key, enc = pe.get('key_file'), pe.get('enc_file')
-
-    if key and enc:
-        # Ensure proper file: prefix if not already present
-        def _fmt(p):
-            p = str(p)
-            if not p.startswith('file:'):
-                return f'file:{p}'
-            return p
-        key_part = _fmt(key)
-        enc_part = _fmt(enc)
-        encrypted_syntax = f'ENCRYPTED_PASSWORD({key_part},{enc_part})'
-        logging.debug("Using Teradata ENCRYPTED_PASSWORD stored-password syntax for connection")
-        return encrypted_syntax
-
-    # If nothing resolved, return empty string (driver will error)
-    logging.error("No password could be resolved from connection config")
-    return ''
 
 def resolve_collectors(config, base_dir):
     collector_files = []
@@ -624,7 +549,20 @@ def metrics():
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
         matched_collectors = resolve_collectors(config, base_dir)
+        # Validate that requested collectors actually exist
+        requested_collectors = config['target'].get('collectors', [])
+        if not matched_collectors:
+            msg = f"No collectors matching patterns {requested_collectors} were found for exporter '{exporter}' in {base_dir}"
+            logging.error(msg)
+            return Response(msg, mimetype='text/plain', status=400)
+
         queries = load_queries_from_collectors(matched_collectors)
+        # If collectors matched but produced no queries/metrics, return an informative error
+        if not queries:
+            matched_names = [name for name, _ in matched_collectors]
+            msg = f"Collectors {matched_names} matched but contain no metrics/queries for exporter '{exporter}'"
+            logging.error(msg)
+            return Response(msg, mimetype='text/plain', status=400)
         tz = get_timezone(global_config, conn_config)
 
         with pool_lock:

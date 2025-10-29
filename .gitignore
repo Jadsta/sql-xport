@@ -1,0 +1,15 @@
+# Ignore Teradata stored-password files and other secret connection material
+# Path: connections/PassKey.properties, connections/EncPass.properties, etc.
+/connections/*.properties
+/connections/*.key
+/connections/*.pem
+
+# Allow example/sample files to be committed
+!connections/*.properties.example
+
+# Common ignores
+__pycache__/
+*.py[cod]
+.venv/
+env/
+/.env
