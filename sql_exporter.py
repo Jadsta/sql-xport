@@ -256,6 +256,13 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
         query_def['metrics'] = metrics
         query_defs.append(query_def)
 
+    # If there are no query definitions, nothing to do — return empty output to
+    # the caller. This protects against creating a ThreadPoolExecutor with
+    # max_workers=0 when there are no queries (which raises ValueError).
+    if not query_defs:
+        logging.error("No query definitions produced from collectors; aborting run_queries")
+        return []
+
     query_retries = (conn_config or {}).get('query_retries', 1)
     query_retry_delay = (conn_config or {}).get('query_retry_delay', 1)
     force_new_connection = conn_config.get('force_new_connection', False) if conn_config else False
