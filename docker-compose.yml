@@ -6,15 +6,22 @@ services:
     container_name: sql-exporter
     ports:
       - "8000:8000"
+      - "8443:8443"
     volumes:
       - ./targets:/home/tdmon/app/targets
       - ./settings.yml:/home/tdmon/app/settings.yml
       - ./gunicorn_config.py:/home/tdmon/app/gunicorn_config.py
+      - ./certs:/certs:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - SSL_CERT=/certs/server.crt
+      - SSL_KEY=/certs/server.key
     restart: unless-stopped
     user: tdmon
     working_dir: /home/tdmon/app
+  # Override command to enable TLS when certs are mounted. If you prefer terminating TLS
+  # outside the container (recommended for production), remove the command override.
+  command: ["/usr/bin/python3", "-m", "gunicorn", "--threads", "1", "--workers", "3", "--bind", "0.0.0.0:8443", "--certfile", "/certs/server.crt", "--keyfile", "/certs/server.key", "sql_exporter:app"]
     logging:
       driver: json-file
       options:
