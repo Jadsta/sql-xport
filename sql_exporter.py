@@ -106,16 +106,20 @@ def resolve_collectors(config, base_dir):
         collector_files.extend(matched)
 
     matched_collectors = []
+    available_collectors = []  # list of (collector_name, file_path)
     for file_path in collector_files:
         with open(file_path) as f:
             collector = yaml.safe_load(f)
             collector_name = collector.get('collector_name')
             logging.debug(f"Evaluating collector '{collector_name}' from file: {file_path}")
-            if collector_name and any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
-                matched_collectors.append((collector_name, collector))
+            if collector_name:
+                available_collectors.append((collector_name, file_path))
+                if any(glob.fnmatch.fnmatch(collector_name, pattern) for pattern in config['target']['collectors']):
+                    matched_collectors.append((collector_name, collector))
 
     logging.info(f"Matched collectors: {[name for name, _ in matched_collectors]}")
-    return matched_collectors
+    logging.debug(f"Available collectors: {available_collectors}")
+    return matched_collectors, available_collectors
 
 def resolve_queries_from_metrics(collector):
     query_map = {q['query_name']: q['query'] for q in collector.get('queries', [])}
@@ -559,11 +563,20 @@ def metrics():
 
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
-        matched_collectors = resolve_collectors(config, base_dir)
+        matched_collectors, available_collectors = resolve_collectors(config, base_dir)
         # Validate that requested collectors actually exist
         requested_collectors = config['target'].get('collectors', [])
         if not matched_collectors:
-            msg = f"No collectors matching patterns {requested_collectors} were found for exporter '{exporter}' in {base_dir}"
+            # If collector files exist but none matched the requested collector names,
+            # return a helpful error listing the available collector names to aid debugging.
+            if available_collectors:
+                available_names = [name for name, _ in available_collectors]
+                msg = (
+                    f"Collectors files were found, but none matched the requested names {requested_collectors}. "
+                    f"Available collector names: {available_names}. Check for misspellings in your collector_name fields."
+                )
+            else:
+                msg = f"No collectors matching patterns {config.get('collector_files', [])} were found for exporter '{exporter}' in {base_dir}"
             logging.error(msg)
             return Response(msg, mimetype='text/plain', status=400)
 
