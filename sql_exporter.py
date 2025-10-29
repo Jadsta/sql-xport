@@ -564,9 +564,11 @@ def metrics():
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
         matched_collectors, available_collectors = resolve_collectors(config, base_dir)
+        logging.debug(f"Post-resolve: matched_collectors type={type(matched_collectors)} repr={matched_collectors}")
+        logging.debug(f"Post-resolve: available_collectors type={type(available_collectors)} repr={available_collectors}")
         # Validate that requested collectors actually exist
         requested_collectors = config['target'].get('collectors', [])
-        if not matched_collectors:
+        if len(matched_collectors) == 0:
             # If collector files exist but none matched the requested collector names,
             # return a helpful error listing the available collector names to aid debugging.
             if available_collectors:
