@@ -267,7 +267,9 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
     query_retry_delay = (conn_config or {}).get('query_retry_delay', 1)
     force_new_connection = conn_config.get('force_new_connection', False) if conn_config else False
     num_queries = len(query_defs)
-    max_workers = min(num_queries, conn_config.get('max_connections', 1) if conn_config else 1)
+    # Respect configured max_connections but ensure at least one worker
+    config_max_conn = (conn_config.get('max_connections', 1) if conn_config else 1)
+    max_workers = max(1, min(num_queries, config_max_conn))
 
     def execute_query(query_def):
         conn_wrapper = None
@@ -523,7 +525,8 @@ def metrics():
 
         # ✅ Extract global settings
         global_config = config.get('global', {})
-        exporter_max_conn = global_config.get('max_connections', 1)
+        # Ensure exporter max connections is at least 1 to avoid zero-worker situations
+        exporter_max_conn = max(1, global_config.get('max_connections', 1))
         max_idle = global_config.get('max_idle_connections', 1)
         max_lifetime = parse_duration(global_config.get('max_connection_lifetime', '0'))
         scrape_timeout_offset = parse_duration(global_config.get('scrape_timeout_offset', '0'))
@@ -551,7 +554,8 @@ def metrics():
             effective_timeout = scrape_timeout
 
         dsn = build_dsn(conn_config)
-        pool_size = conn_config.get('max_connections', 1)
+        # Ensure pool size is at least 1
+        pool_size = max(1, conn_config.get('max_connections', 1))
 
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
@@ -574,6 +578,7 @@ def metrics():
 
         with pool_lock:
             num_to_acquire = min(exporter_max_conn, pool_size)
+            num_to_acquire = max(1, num_to_acquire)
             acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, conn_config=conn_config, max_lifetime=max_lifetime)
             temp_pool = Queue(maxsize=num_to_acquire)
             for conn in acquired_conns:
@@ -628,7 +633,8 @@ def initialize_connection_pools():
         logging.info(f"log_scraped_metrics enabled: {log_metrics}")
         data_sources = settings.get('data_sources', {})
         for data_source_name, conn_config in data_sources.items():
-            pool_size = conn_config.get('max_connections', 1)
+            # Ensure pool_size is at least 1 when pre-populating
+            pool_size = max(1, conn_config.get('max_connections', 1))
             connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
             # Pre-populate pool with live connections
             with pool_lock:
