@@ -574,18 +574,23 @@ def make_text_response(body_text, status=200):
 
     content_type = 'text/plain; charset=utf-8; escaping=underscores'
     accept_enc = request.headers.get('Accept-Encoding', '') or ''
+    logging.debug(f"Client Accept-Encoding header: '{accept_enc}'")
     if 'gzip' in accept_enc.lower():
+        logging.info("Client supports gzip; attempting to compress response")
         try:
             compressed = gzip.compress(body_bytes)
+            logging.info(f"Compressed response: {len(body_bytes)} -> {len(compressed)} bytes")
             resp = Response(compressed, status=status)
             resp.headers['Content-Encoding'] = 'gzip'
             resp.headers['Content-Type'] = content_type
             resp.headers['Content-Length'] = str(len(compressed))
             return resp
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Gzip compression failed: {e}; sending uncompressed response")
             # fallback to uncompressed
             pass
 
+    logging.debug("Sending uncompressed response")
     resp = Response(body_bytes, status=status)
     resp.headers['Content-Type'] = content_type
     resp.headers['Content-Length'] = str(len(body_bytes))
