@@ -1,4 +1,5 @@
 global:
+  log_level: INFO    # Use INFO for general operational logs or DEBUG for detailed debug logs
   log_scraped_metrics: true  # Set to true to log all scraped metrics with timestamp
   timezone: "Australia/Sydney"  # Default timezone for logs and DB timestamp localization
   # ...other global settings...

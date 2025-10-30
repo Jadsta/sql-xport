@@ -22,12 +22,32 @@ except Exception:
 
 
 
-# Configure logging
+# Configure logging based on settings.yml (global.log_level). If settings.yml is missing or
+# the setting is invalid, fall back to INFO.
+_level = logging.INFO
+try:
+    _settings_path = Path(__file__).parent / 'settings.yml'
+    if _settings_path.exists():
+        try:
+            import yaml as _yaml
+            _settings = _yaml.safe_load(_settings_path.read_text()) or {}
+            _gl = (_settings.get('global') or {})
+            _lvl = _gl.get('log_level') or _gl.get('logging_level')
+            if _lvl:
+                _lvl_name = str(_lvl).upper()
+                _level = getattr(logging, _lvl_name, logging.INFO)
+        except Exception:
+            # Ignore YAML parse/read errors and use default level
+            _level = logging.INFO
+except Exception:
+    _level = logging.INFO
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=_level,
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+logging.getLogger().info(f"Logging initialized at level: {logging.getLevelName(_level)} (from settings.yml)")
 
 
 class TZFormatter(logging.Formatter):
@@ -595,7 +615,8 @@ def make_text_response(body_text, status=200):
     except Exception:
         body_bytes = str(body_text).encode('utf-8')
 
-    content_type = 'text/plain; version=0.0.4; charset=utf-8; escaping=underscores'
+    # Use escaping=allow-utf-8 to match the old exporter behavior (allows UTF-8 in label values)
+    content_type = 'text/plain; version=0.0.4; charset=utf-8; escaping=allow-utf-8'
     accept_enc = request.headers.get('Accept-Encoding', '') or ''
     logging.debug(f"Client Accept-Encoding header: '{accept_enc}'")
     # Always advertise that the response varies by Accept-Encoding so proxies
