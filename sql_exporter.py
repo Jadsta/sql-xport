@@ -595,9 +595,12 @@ def make_text_response(body_text, status=200):
     except Exception:
         body_bytes = str(body_text).encode('utf-8')
 
-    content_type = 'text/plain; charset=utf-8; escaping=underscores'
+    content_type = 'text/plain; version=0.0.4; charset=utf-8; escaping=underscores'
     accept_enc = request.headers.get('Accept-Encoding', '') or ''
     logging.debug(f"Client Accept-Encoding header: '{accept_enc}'")
+    # Always advertise that the response varies by Accept-Encoding so proxies
+    # don't cache the wrong representation.
+    vary_header = 'Accept-Encoding'
     if 'gzip' in accept_enc.lower():
         logging.info("Client supports gzip; attempting to compress response")
         try:
@@ -607,6 +610,8 @@ def make_text_response(body_text, status=200):
             resp.headers['Content-Encoding'] = 'gzip'
             resp.headers['Content-Type'] = content_type
             resp.headers['Content-Length'] = str(len(compressed))
+            resp.headers['Vary'] = vary_header
+            resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
             return resp
         except Exception as e:
             logging.warning(f"Gzip compression failed: {e}; sending uncompressed response")
@@ -617,6 +622,8 @@ def make_text_response(body_text, status=200):
     resp = Response(body_bytes, status=status)
     resp.headers['Content-Type'] = content_type
     resp.headers['Content-Length'] = str(len(body_bytes))
+    resp.headers['Vary'] = 'Accept-Encoding'
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     return resp
 
 @app.route('/metrics')
