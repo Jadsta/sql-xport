@@ -629,6 +629,12 @@ def make_text_response(body_text, status=200):
 @app.route('/metrics')
 def metrics():
     exporter = request.args.get('exporter')
+    # Log incoming request headers at DEBUG for troubleshooting Prometheus scrapes.
+    try:
+        hdrs = {k: ('***' if k.lower() in ('authorization', 'proxy-authorization') else v) for k, v in request.headers.items()}
+        logging.debug(f"Incoming request from {request.remote_addr}, path={request.path}, headers={hdrs}")
+    except Exception as e:
+        logging.debug(f"Failed to serialize request headers for debug logging: {e}")
     if not exporter:
         logging.warning("Missing 'exporter' parameter in request")
         return make_text_response("Missing 'exporter' parameter", status=400)
