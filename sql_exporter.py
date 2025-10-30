@@ -4,6 +4,7 @@ import time                     # For timestamps and connection lifetime trackin
 import logging                  # For structured logging
 from pathlib import Path        # For clean file path handling
 from flask import Flask, request, Response  # For HTTP metrics endpoint
+import gzip
 import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
 from threading import Semaphore, Lock # For limiting concurrent connections
@@ -208,7 +209,7 @@ def format_value(val):
         if float_val == 0:
             return "0"
         elif abs(float_val) >= 1e6 or abs(float_val) < 1e-3:
-            return f"{float_val:.7e}"
+            return f"{float_val:.9e}"
         else:
             return f"{float_val:.6f}".rstrip('0').rstrip('.')
     except (ValueError, TypeError):
@@ -561,17 +562,46 @@ def get_timezone(global_config, conn_config):
     else:
         return pytz.timezone(tz_name)
 
+
+def make_text_response(body_text, status=200):
+    """Create a text/plain response with escaping=underscores in Content-Type and
+    gzip-compressed body when the client supports it via Accept-Encoding.
+    """
+    try:
+        body_bytes = body_text.encode('utf-8') if isinstance(body_text, str) else body_text
+    except Exception:
+        body_bytes = str(body_text).encode('utf-8')
+
+    content_type = 'text/plain; charset=utf-8; escaping=underscores'
+    accept_enc = request.headers.get('Accept-Encoding', '') or ''
+    if 'gzip' in accept_enc.lower():
+        try:
+            compressed = gzip.compress(body_bytes)
+            resp = Response(compressed, status=status)
+            resp.headers['Content-Encoding'] = 'gzip'
+            resp.headers['Content-Type'] = content_type
+            resp.headers['Content-Length'] = str(len(compressed))
+            return resp
+        except Exception:
+            # fallback to uncompressed
+            pass
+
+    resp = Response(body_bytes, status=status)
+    resp.headers['Content-Type'] = content_type
+    resp.headers['Content-Length'] = str(len(body_bytes))
+    return resp
+
 @app.route('/metrics')
 def metrics():
     exporter = request.args.get('exporter')
     if not exporter:
         logging.warning("Missing 'exporter' parameter in request")
-        return "Missing 'exporter' parameter", 400
+        return make_text_response("Missing 'exporter' parameter", status=400)
     # Sanitize exporter name: only allow alphanumeric, underscore, dash
     import re
     if not re.match(r'^[A-Za-z0-9_-]+$', exporter):
         logging.warning(f"Invalid exporter parameter: {exporter}")
-        return "Invalid 'exporter' parameter", 400
+        return make_text_response("Invalid 'exporter' parameter", status=400)
 
     try:
         config, base_dir = load_sql_exporter_config(exporter)
