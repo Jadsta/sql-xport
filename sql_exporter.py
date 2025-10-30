@@ -209,7 +209,30 @@ def format_value(val):
         if float_val == 0:
             return "0"
         elif abs(float_val) >= 1e6 or abs(float_val) < 1e-3:
-            return f"{float_val:.9e}"
+            # Historically the exporter used an exponential format whose
+            # precision varied with the magnitude (e+07 -> 7 digits, e+09 -> 9 digits, etc.).
+            # Reproduce that behavior: use the absolute value of the base-10
+            # exponent as the number of digits after the decimal point in
+            # the exponential representation.
+            import math
+            try:
+                exponent = int(math.floor(math.log10(abs(float_val))))
+            except Exception:
+                exponent = 0
+            precision = abs(exponent) if exponent != 0 else 1
+            # Cap precision to avoid extremely long outputs for very large/small values
+            precision = max(1, min(precision, 12))
+            # Format then strip trailing zeros from the mantissa (but keep at least one digit)
+            s = f"{float_val:.{precision}e}"
+            try:
+                mantissa, exp = s.split('e')
+                mantissa = mantissa.rstrip('0').rstrip('.')
+                if mantissa == '' or mantissa == '-' or mantissa == '+':
+                    mantissa = '0'
+                s = f"{mantissa}e{exp}"
+            except Exception:
+                pass
+            return s
         else:
             return f"{float_val:.6f}".rstrip('0').rstrip('.')
     except (ValueError, TypeError):
