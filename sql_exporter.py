@@ -399,7 +399,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             while attempt < query_retries:
                 try:
                     cursor = conn_wrapper.conn.cursor()
-                    logging.info(f"[DEBUG] Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
+                    logging.debug(f"Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
                     cursor.execute(sql)
                     rows = cursor.fetchall()
                     break  # Success
