@@ -663,7 +663,7 @@ def metrics():
             else:
                 msg = f"No collectors matching patterns {config.get('collector_files', [])} were found for exporter '{exporter}' in {base_dir}"
             logging.error(msg)
-            return Response(msg, mimetype='text/plain', status=400)
+            return make_text_response(msg, status=400)
 
         queries = load_queries_from_collectors(matched_collectors)
         # If collectors matched but produced no queries/metrics, return an informative error
@@ -671,7 +671,7 @@ def metrics():
             matched_names = [name for name, _ in matched_collectors]
             msg = f"Collectors {matched_names} matched but contain no metrics/queries for exporter '{exporter}'"
             logging.error(msg)
-            return Response(msg, mimetype='text/plain', status=400)
+            return make_text_response(msg, status=400)
         tz = get_timezone(global_config, conn_config)
 
         with pool_lock:
@@ -689,7 +689,7 @@ def metrics():
                 metrics_output = future.result(timeout=effective_timeout)
             except TimeoutError:
                 logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
-                return Response(f'up{{target="unknown"}} 0\nerror{{message="scrape_timeout"}} 1', mimetype='text/plain', status=504)
+                return make_text_response('up{target="unknown"} 0\nerror{message="scrape_timeout"} 1', status=504)
 
         with pool_lock:
             while not temp_pool.empty():
@@ -709,11 +709,11 @@ def metrics():
             logging.info(f"--- Metrics scrape at {log_time} ---\n" + "\n".join(metrics_output) + "\n--- End scrape ---")
 
         logging.info(f"Scrape completed in {duration:.3f} seconds")
-        return Response("\n".join(metrics_output), mimetype='text/plain')
+        return make_text_response("\n".join(metrics_output), status=200)
 
     except Exception as e:
         logging.error(f"Error during scrape: {str(e)}")
-        return Response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', mimetype='text/plain', status=500)
+        return make_text_response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', status=500)
 
 # --- Pre-populate connection pools at startup ---
 def initialize_connection_pools():
