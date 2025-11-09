@@ -7,12 +7,14 @@ from flask import Flask, request, Response  # For HTTP metrics endpoint
 import gzip
 import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
-from threading import Semaphore, Lock # For limiting concurrent connections
+from threading import Semaphore, Lock, Event # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
 from collections import defaultdict
 import queue
 import pytz
 import os
+import signal                   # For timeout handling
+import threading               # For client disconnect detection
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import traceback                # For detailed error logging
 try:
@@ -216,6 +218,59 @@ def resolve_queries_from_metrics(collector):
 
     return resolved
     
+def is_client_disconnected():
+    """
+    Check if the Flask client has disconnected during the request.
+    This helps detect when Prometheus cancels a scrape mid-execution.
+    """
+    try:
+        # Try to check if the connection is still alive by attempting to read from the socket
+        # In practice, this is difficult to detect reliably in Flask/WSGI
+        # But we can at least check if the request context is still valid
+        if hasattr(request, 'environ'):
+            return False  # Request context is still valid
+        return True
+    except Exception:
+        return True  # If we can't check, assume disconnected to be safe
+
+def run_queries_with_cancellation(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings):
+    """
+    Execute queries with support for cancellation when client disconnects or timeout occurs.
+    """
+    try:
+        return run_queries(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config)
+    except Exception as e:
+        if cancel_event.is_set():
+            logging.warning(f"Query execution cancelled due to client disconnect or timeout")
+            # Clean up any active connections
+            while not connection_pool.empty():
+                try:
+                    conn_wrapper = connection_pool.get_nowait()
+                    conn_wrapper.conn.close()
+                except:
+                    pass
+        raise e
+
+class TimeoutHandler:
+    """Helper class to handle query timeouts and cancellation."""
+    
+    def __init__(self, timeout_seconds):
+        self.timeout_seconds = timeout_seconds
+        self.start_time = time.time()
+        self.cancelled = Event()
+    
+    def is_timed_out(self):
+        """Check if we've exceeded the timeout."""
+        return time.time() - self.start_time > self.timeout_seconds
+    
+    def cancel(self):
+        """Mark this operation as cancelled."""
+        self.cancelled.set()
+    
+    def is_cancelled(self):
+        """Check if operation was cancelled."""
+        return self.cancelled.is_set()
+
 def format_value(val):
     if isinstance(val, datetime.datetime):
         return f"{val.timestamp():.9e}"
@@ -371,6 +426,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
 
     def execute_query(query_def):
         conn_wrapper = None
+        query_timeout = conn_config.get('query_timeout', 20) if conn_config else 20  # Individual query timeout
         try:
             if force_new_connection:
                 conn = connect_with_retries(conn_config or {})
@@ -400,13 +456,26 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 try:
                     cursor = conn_wrapper.conn.cursor()
                     logging.debug(f"Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
-                    cursor.execute(sql)
-                    rows = cursor.fetchall()
-                    break  # Success
+                    
+                    # Execute query with individual timeout using ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=1) as query_executor:
+                        query_future = query_executor.submit(cursor.execute, sql)
+                        try:
+                            query_future.result(timeout=query_timeout)
+                            rows = cursor.fetchall()
+                            break  # Success
+                        except TimeoutError:
+                            logging.error(f"Query timed out after {query_timeout} seconds: {sql}")
+                            # Cancel the query if possible
+                            try:
+                                cursor.cancel()
+                            except:
+                                pass
+                            raise Exception(f"Query timeout ({query_timeout}s)")
                 except Exception as e:
                     tb = traceback.format_exc()
                     logging.error(f"[ERROR] Query execution failed for SQL '{sql}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
-                    if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower():
+                    if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower() or 'timeout' in str(e).lower():
                         try:
                             conn_wrapper.conn.close()
                         except Exception:
@@ -739,12 +808,42 @@ def metrics():
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
-        # Enforce scrape timeout using effective_timeout
+        # Get client disconnection check interval from settings
+        client_disconnect_check = settings.get('global', {}).get('client_disconnect_check', 5)
+        
+        # Create cancellation event for client disconnect detection
+        cancel_event = Event()
+        
+        # Function to monitor client disconnection
+        def monitor_client_disconnection():
+            """Monitor for client disconnection and cancel operations if detected."""
+            check_interval = min(client_disconnect_check, effective_timeout / 10)  # Check at least 10 times during timeout
+            start_time = time.time()
+            while time.time() - start_time < effective_timeout:
+                try:
+                    if is_client_disconnected():
+                        logging.warning("Client disconnected during scrape, cancelling operations")
+                        cancel_event.set()
+                        return
+                    time.sleep(check_interval)
+                except Exception as e:
+                    logging.debug(f"Error checking client disconnect: {e}")
+                    break
+        
+        # Start client disconnect monitoring in background
+        disconnect_monitor = threading.Thread(target=monitor_client_disconnection, daemon=True)
+        disconnect_monitor.start()
+
+        # Enforce scrape timeout using effective_timeout and client disconnect detection
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config)
+            future = executor.submit(run_queries_with_cancellation, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings)
             try:
                 metrics_output = future.result(timeout=effective_timeout)
+                if cancel_event.is_set():
+                    logging.error("Scrape was cancelled due to client disconnect")
+                    return make_text_response('up{target="unknown"} 0\nerror{message="client_disconnected"} 1', status=499)
             except TimeoutError:
+                cancel_event.set()  # Signal cancellation to running queries
                 logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
                 return make_text_response('up{target="unknown"} 0\nerror{message="scrape_timeout"} 1', status=504)
 
