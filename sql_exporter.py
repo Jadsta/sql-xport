@@ -218,30 +218,15 @@ def resolve_queries_from_metrics(collector):
 
     return resolved
     
-def is_client_disconnected():
-    """
-    Check if the Flask client has disconnected during the request.
-    This helps detect when Prometheus cancels a scrape mid-execution.
-    """
-    try:
-        # Try to check if the connection is still alive by attempting to read from the socket
-        # In practice, this is difficult to detect reliably in Flask/WSGI
-        # But we can at least check if the request context is still valid
-        if hasattr(request, 'environ'):
-            return False  # Request context is still valid
-        return True
-    except Exception:
-        return True  # If we can't check, assume disconnected to be safe
-
 def run_queries_with_cancellation(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings):
     """
-    Execute queries with support for cancellation when client disconnects or timeout occurs.
+    Execute queries with support for cancellation when timeout occurs.
     """
     try:
         return run_queries(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config)
     except Exception as e:
         if cancel_event.is_set():
-            logging.warning(f"Query execution cancelled due to client disconnect or timeout")
+            logging.warning(f"Query execution cancelled due to timeout")
             # Clean up any active connections
             while not connection_pool.empty():
                 try:
@@ -808,40 +793,14 @@ def metrics():
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
-        # Get client disconnection check interval from settings
-        client_disconnect_check = settings.get('global', {}).get('client_disconnect_check', 5)
-        
-        # Create cancellation event for client disconnect detection
+        # Create cancellation event for timeout handling
         cancel_event = Event()
-        
-        # Function to monitor client disconnection
-        def monitor_client_disconnection():
-            """Monitor for client disconnection and cancel operations if detected."""
-            check_interval = min(client_disconnect_check, effective_timeout / 10)  # Check at least 10 times during timeout
-            start_time = time.time()
-            while time.time() - start_time < effective_timeout:
-                try:
-                    if is_client_disconnected():
-                        logging.warning("Client disconnected during scrape, cancelling operations")
-                        cancel_event.set()
-                        return
-                    time.sleep(check_interval)
-                except Exception as e:
-                    logging.debug(f"Error checking client disconnect: {e}")
-                    break
-        
-        # Start client disconnect monitoring in background
-        disconnect_monitor = threading.Thread(target=monitor_client_disconnection, daemon=True)
-        disconnect_monitor.start()
 
-        # Enforce scrape timeout using effective_timeout and client disconnect detection
+        # Enforce scrape timeout using effective_timeout
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(run_queries_with_cancellation, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings)
             try:
                 metrics_output = future.result(timeout=effective_timeout)
-                if cancel_event.is_set():
-                    logging.error("Scrape was cancelled due to client disconnect")
-                    return make_text_response('up{target="unknown"} 0\nerror{message="client_disconnected"} 1', status=499)
             except TimeoutError:
                 cancel_event.set()  # Signal cancellation to running queries
                 logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
