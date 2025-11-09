@@ -4,7 +4,7 @@ global:
   timezone: "Australia/Sydney"  # Default timezone for logs and DB timestamp localization
   # Timeout settings to prevent stuck sessions 
   scrape_timeout: 30          # Default scrape timeout in seconds
-  query_timeout: 20           # Individual query timeout in seconds
+  request_timeout: 20         # Individual query timeout in seconds (Teradata native)
   # ...other global settings...
 
 data_sources:
@@ -17,7 +17,7 @@ data_sources:
     connection_retries: 3  # Number of times to retry connecting if initial attempt fails
     retry_delay: 2         # Delay (seconds) between retries
     connect_timeout: 10    # Timeout (seconds) for establishing a connection
-    query_timeout: 15      # Timeout (seconds) for individual query execution
+    request_timeout: 15    # Timeout (seconds) for individual query execution (Teradata native)
     idle_timeout: 300      # How long (seconds) an idle connection stays in the pool before being closed
     logmech: "TD2"        # Example: Teradata logon mechanism
     query_band: "app=py_sql_exporter;env=prod;"  # Example query band for this data source
@@ -31,7 +31,7 @@ data_sources:
     connection_retries: 3
     retry_delay: 2
     connect_timeout: 10
-    query_timeout: 15   # Timeout (seconds) for individual query execution
+    request_timeout: 15   # Timeout (seconds) for individual query execution (Teradata native)
     idle_timeout: 300
     logmech: "TD2"
     # Add other connection settings as needed

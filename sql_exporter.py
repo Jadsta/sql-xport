@@ -149,7 +149,7 @@ def build_dsn(conn_config):
         "password": conn_config.get("password")
     }
     # Include optional parameters if present
-    for key in ["logmech", "connect_timeout"]:
+    for key in ["logmech", "connect_timeout", "request_timeout"]:
         if key in conn_config:
             dsn[key] = conn_config[key]
     # Do NOT set queryBand here; it is set after connection
@@ -411,7 +411,6 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
 
     def execute_query(query_def):
         conn_wrapper = None
-        query_timeout = conn_config.get('query_timeout', 20) if conn_config else 20  # Individual query timeout
         try:
             if force_new_connection:
                 conn = connect_with_retries(conn_config or {})
@@ -442,21 +441,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     cursor = conn_wrapper.conn.cursor()
                     logging.debug(f"Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
                     
-                    # Execute query with individual timeout using ThreadPoolExecutor
-                    with ThreadPoolExecutor(max_workers=1) as query_executor:
-                        query_future = query_executor.submit(cursor.execute, sql)
-                        try:
-                            query_future.result(timeout=query_timeout)
-                            rows = cursor.fetchall()
-                            break  # Success
-                        except TimeoutError:
-                            logging.error(f"Query timed out after {query_timeout} seconds: {sql}")
-                            # Cancel the query if possible
-                            try:
-                                cursor.cancel()
-                            except:
-                                pass
-                            raise Exception(f"Query timeout ({query_timeout}s)")
+                    # Execute query directly - request_timeout is handled by Teradata driver
+                    cursor.execute(sql)
+                    rows = cursor.fetchall()
+                    break  # Success
                 except Exception as e:
                     tb = traceback.format_exc()
                     logging.error(f"[ERROR] Query execution failed for SQL '{sql}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
@@ -888,3 +876,46 @@ def initialize_connection_pools():
 
 # Call this at startup
 initialize_connection_pools()
+
+def graceful_shutdown():
+    """
+    Gracefully close all database connections when shutting down.
+    Called on SIGTERM (docker stop) or SIGINT (Ctrl+C).
+    """
+    logging.info("Graceful shutdown initiated - closing database connections...")
+    try:
+        # Close all connection pools
+        for data_source_name, (pool, lock) in connection_pools.items():
+            logging.info(f"Closing connection pool for '{data_source_name}'...")
+            with lock:
+                closed_count = 0
+                while not pool.empty():
+                    try:
+                        conn_wrapper = pool.get_nowait()
+                        conn_wrapper.conn.close()
+                        closed_count += 1
+                    except Exception as e:
+                        logging.warning(f"Error closing connection in pool '{data_source_name}': {e}")
+                logging.info(f"Closed {closed_count} connections for '{data_source_name}'")
+        logging.info("Graceful shutdown completed")
+    except Exception as e:
+        logging.error(f"Error during graceful shutdown: {e}")
+
+def signal_handler(signum, frame):
+    """
+    Handle shutdown signals (SIGTERM from docker stop, SIGINT from Ctrl+C).
+    """
+    signal_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT" if signum == signal.SIGINT else f"Signal {signum}"
+    logging.info(f"Received {signal_name} - initiating graceful shutdown...")
+    graceful_shutdown()
+    logging.info("Exiting...")
+    os._exit(0)
+
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGTERM, signal_handler)  # Docker stop
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+logging.info("Signal handlers registered for graceful shutdown (SIGTERM, SIGINT)")
+
+# Register cleanup function to run on normal exit as well
+import atexit
+atexit.register(graceful_shutdown)

@@ -18,6 +18,9 @@ max_requests = 1000       # Restart workers after this many requests (prevents m
 max_requests_jitter = 50  # Add randomness to worker restart
 preload_app = False       # Don't preload to allow per-worker cleanup
 
+# Enable proper signal handling for Docker
+enable_stdio_inheritance = True
+
 disable_redirect_access_to_syslog = True
 
 
@@ -25,3 +28,13 @@ disable_redirect_access_to_syslog = True
 ### As well as change bind to use :8443.
 # certfile = "/certs/server.crt"
 # keyfile = "/certs/server.key"
+
+def worker_exit(server, worker):
+    """Called when a worker is exiting (for cleanup)."""
+    import logging
+    logging.info(f"Worker {worker.pid} exiting - cleanup initiated")
+
+def on_exit(server):
+    """Called when the master process is exiting."""
+    import logging
+    logging.info("Gunicorn master process exiting")
