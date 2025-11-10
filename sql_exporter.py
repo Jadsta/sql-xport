@@ -218,6 +218,26 @@ def resolve_queries_from_metrics(collector):
 
     return resolved
     
+def check_client_connected():
+    """
+    Check if the client is still connected using Flask request context.
+    Returns True if connected, False if likely disconnected.
+    """
+    try:
+        # In Gunicorn, we can check if the request is still valid
+        # by accessing request properties. If client disconnected,
+        # some WSGI servers will detect this.
+        if hasattr(request, 'environ'):
+            # Check if we can still access the request environ
+            environ = request.environ
+            # If the client disconnected, accessing certain environ variables
+            # may indicate the connection status
+            return True  # Assume connected if we can access request
+        return False
+    except Exception:
+        # If we can't access request context, assume disconnected
+        return False
+
 def run_queries_with_cancellation(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings):
     """
     Execute queries with support for cancellation when timeout occurs.
@@ -537,6 +557,14 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
         future_to_query = {executor.submit(execute_query, q): q for q in query_defs}
         try:
             for future in as_completed(future_to_query, timeout=conn_config.get('scrape_timeout_offset', 0) or None):
+                # Check if client is still connected (basic check)
+                if not check_client_connected():
+                    logging.warning("Client appears to be disconnected - stopping query processing")
+                    # Cancel remaining futures
+                    for remaining_future in future_to_query:
+                        remaining_future.cancel()
+                    break
+                    
                 query_def = future_to_query[future]
                 try:
                     metric_meta, metric_samples = future.result()

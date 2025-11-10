@@ -5,6 +5,8 @@ global:
   # Timeout settings to prevent stuck sessions 
   scrape_timeout: 30          # Default scrape timeout in seconds
   request_timeout: 20         # Individual query timeout in seconds (Teradata native)
+  # Worker timeout should be longer than scrape_timeout to allow graceful completion
+  worker_timeout: 45          # Gunicorn worker timeout (kills stuck workers)
   # ...other global settings...
 
 data_sources:
