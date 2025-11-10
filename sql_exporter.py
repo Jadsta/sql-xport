@@ -456,6 +456,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             metric_samples = defaultdict(list)
             metric_meta = {}
             attempt = 0
+            cursor = None
             while attempt < query_retries:
                 try:
                     cursor = conn_wrapper.conn.cursor()
@@ -468,6 +469,14 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                 except Exception as e:
                     tb = traceback.format_exc()
                     logging.error(f"[ERROR] Query execution failed for SQL '{sql}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
+                    # Always close cursor on failure before retry
+                    if cursor:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+                        cursor = None
+                    
                     if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower() or 'timeout' in str(e).lower():
                         try:
                             conn_wrapper.conn.close()
@@ -481,6 +490,14 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                         continue
                     else:
                         raise
+                finally:
+                    # Ensure cursor is closed after each attempt
+                    if cursor and 'e' in locals():  # Only close on exception, keep open for success
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+                        cursor = None
             else:
                 raise Exception(f"Query failed after {query_retries} retries due to lost connection.")
 
@@ -532,6 +549,15 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     labels_sorted = sorted(labels, key=lambda x: x.split('=')[0])
                     metric_line = f"{metric_name}{{{','.join(labels_sorted)}}} {value}{timestamp}"
                     metric_samples[metric_name].append(metric_line)
+            
+            # Always close cursor after processing metrics
+            if cursor:
+                try:
+                    cursor.close()
+                    logging.debug(f"Cursor closed successfully for SQL: {sql}")
+                except Exception as cursor_close_exc:
+                    logging.warning(f"Failed to close cursor for SQL '{sql}': {cursor_close_exc}")
+            
             # Return connection to pool if not forced new
             if not force_new_connection and connection_pool.qsize() < max_idle:
                 connection_pool.put(conn_wrapper)
@@ -542,6 +568,14 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     pass
             return metric_meta, metric_samples
         except Exception as e:
+            # Ensure cursor is closed on any exception
+            if 'cursor' in locals() and cursor:
+                try:
+                    cursor.close()
+                    logging.debug(f"Cursor closed in exception handler for SQL: {sql}")
+                except Exception as cursor_close_exc:
+                    logging.warning(f"Failed to close cursor in exception handler for SQL '{sql}': {cursor_close_exc}")
+            
             if conn_wrapper:
                 try:
                     conn_wrapper.conn.close()
