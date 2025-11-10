@@ -7,14 +7,12 @@ from flask import Flask, request, Response  # For HTTP metrics endpoint
 import gzip
 import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
-from threading import Semaphore, Lock, Event # For limiting concurrent connections
+from threading import Semaphore, Lock # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
 from collections import defaultdict
 import queue
 import pytz
 import os
-import signal                   # For timeout handling
-import threading               # For client disconnect detection
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import traceback                # For detailed error logging
 try:
@@ -149,7 +147,7 @@ def build_dsn(conn_config):
         "password": conn_config.get("password")
     }
     # Include optional parameters if present
-    for key in ["logmech", "connect_timeout", "request_timeout"]:
+    for key in ["logmech", "connect_timeout"]:
         if key in conn_config:
             dsn[key] = conn_config[key]
     # Do NOT set queryBand here; it is set after connection
@@ -218,64 +216,6 @@ def resolve_queries_from_metrics(collector):
 
     return resolved
     
-def check_client_connected():
-    """
-    Check if the client is still connected using Flask request context.
-    Returns True if connected, False if likely disconnected.
-    """
-    try:
-        # In Gunicorn, we can check if the request is still valid
-        # by accessing request properties. If client disconnected,
-        # some WSGI servers will detect this.
-        if hasattr(request, 'environ'):
-            # Check if we can still access the request environ
-            environ = request.environ
-            # If the client disconnected, accessing certain environ variables
-            # may indicate the connection status
-            return True  # Assume connected if we can access request
-        return False
-    except Exception:
-        # If we can't access request context, assume disconnected
-        return False
-
-def run_queries_with_cancellation(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings):
-    """
-    Execute queries with support for cancellation when timeout occurs.
-    """
-    try:
-        return run_queries(dsn, queries, connection_pool, max_idle, max_lifetime, tz, conn_config)
-    except Exception as e:
-        if cancel_event.is_set():
-            logging.warning(f"Query execution cancelled due to timeout")
-            # Clean up any active connections
-            while not connection_pool.empty():
-                try:
-                    conn_wrapper = connection_pool.get_nowait()
-                    conn_wrapper.conn.close()
-                except:
-                    pass
-        raise e
-
-class TimeoutHandler:
-    """Helper class to handle query timeouts and cancellation."""
-    
-    def __init__(self, timeout_seconds):
-        self.timeout_seconds = timeout_seconds
-        self.start_time = time.time()
-        self.cancelled = Event()
-    
-    def is_timed_out(self):
-        """Check if we've exceeded the timeout."""
-        return time.time() - self.start_time > self.timeout_seconds
-    
-    def cancel(self):
-        """Mark this operation as cancelled."""
-        self.cancelled.set()
-    
-    def is_cancelled(self):
-        """Check if operation was cancelled."""
-        return self.cancelled.is_set()
-
 def format_value(val):
     if isinstance(val, datetime.datetime):
         return f"{val.timestamp():.9e}"
@@ -431,6 +371,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
 
     def execute_query(query_def):
         conn_wrapper = None
+        cursor = None
         try:
             if force_new_connection:
                 conn = connect_with_retries(conn_config or {})
@@ -456,28 +397,26 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
             metric_samples = defaultdict(list)
             metric_meta = {}
             attempt = 0
-            cursor = None
             while attempt < query_retries:
                 try:
                     cursor = conn_wrapper.conn.cursor()
                     logging.debug(f"Executing on connection: {conn_wrapper.conn}, cursor: {cursor}")
-                    
-                    # Execute query directly - request_timeout is handled by Teradata driver
                     cursor.execute(sql)
                     rows = cursor.fetchall()
                     break  # Success
                 except Exception as e:
-                    tb = traceback.format_exc()
-                    logging.error(f"[ERROR] Query execution failed for SQL '{sql}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
-                    # Always close cursor on failure before retry
+                    # Close cursor before retrying if it exists
                     if cursor:
                         try:
                             cursor.close()
-                        except Exception:
-                            pass
+                            logging.debug(f"Cursor closed before retry for SQL: {sql}")
+                        except Exception as cursor_close_exc:
+                            logging.warning(f"Failed to close cursor before retry for SQL '{sql}': {cursor_close_exc}")
                         cursor = None
                     
-                    if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower() or 'timeout' in str(e).lower():
+                    tb = traceback.format_exc()
+                    logging.error(f"[ERROR] Query execution failed for SQL '{sql}' (attempt {attempt+1}): {e}\nTraceback:\n{tb}")
+                    if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower():
                         try:
                             conn_wrapper.conn.close()
                         except Exception:
@@ -490,14 +429,6 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                         continue
                     else:
                         raise
-                finally:
-                    # Ensure cursor is closed after each attempt
-                    if cursor and 'e' in locals():  # Only close on exception, keep open for success
-                        try:
-                            cursor.close()
-                        except Exception:
-                            pass
-                        cursor = None
             else:
                 raise Exception(f"Query failed after {query_retries} retries due to lost connection.")
 
@@ -550,14 +481,6 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     metric_line = f"{metric_name}{{{','.join(labels_sorted)}}} {value}{timestamp}"
                     metric_samples[metric_name].append(metric_line)
             
-            # Always close cursor after processing metrics
-            if cursor:
-                try:
-                    cursor.close()
-                    logging.debug(f"Cursor closed successfully for SQL: {sql}")
-                except Exception as cursor_close_exc:
-                    logging.warning(f"Failed to close cursor for SQL '{sql}': {cursor_close_exc}")
-            
             # Return connection to pool if not forced new
             if not force_new_connection and connection_pool.qsize() < max_idle:
                 connection_pool.put(conn_wrapper)
@@ -568,20 +491,20 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
                     pass
             return metric_meta, metric_samples
         except Exception as e:
-            # Ensure cursor is closed on any exception
-            if 'cursor' in locals() and cursor:
-                try:
-                    cursor.close()
-                    logging.debug(f"Cursor closed in exception handler for SQL: {sql}")
-                except Exception as cursor_close_exc:
-                    logging.warning(f"Failed to close cursor in exception handler for SQL '{sql}': {cursor_close_exc}")
-            
             if conn_wrapper:
                 try:
                     conn_wrapper.conn.close()
                 except Exception as close_exc:
                     logging.error(f"[ERROR] Failed to close connection after error: {close_exc}")
             raise e
+        finally:
+            # Always close cursor to prevent Teradata sessions from staying in responding state
+            if cursor:
+                try:
+                    cursor.close()
+                    logging.debug(f"Cursor closed in finally block for SQL: {sql}")
+                except Exception as cursor_close_exc:
+                    logging.warning(f"Failed to close cursor in finally block for SQL '{sql}': {cursor_close_exc}")
 
     # Collect all metric samples and meta from all queries
     all_metric_meta = {}
@@ -591,14 +514,6 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, tz, 
         future_to_query = {executor.submit(execute_query, q): q for q in query_defs}
         try:
             for future in as_completed(future_to_query, timeout=conn_config.get('scrape_timeout_offset', 0) or None):
-                # Check if client is still connected (basic check)
-                if not check_client_connected():
-                    logging.warning("Client appears to be disconnected - stopping query processing")
-                    # Cancel remaining futures
-                    for remaining_future in future_to_query:
-                        remaining_future.cancel()
-                    break
-                    
                 query_def = future_to_query[future]
                 try:
                     metric_meta, metric_samples = future.result()
@@ -843,16 +758,12 @@ def metrics():
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
-        # Create cancellation event for timeout handling
-        cancel_event = Event()
-
         # Enforce scrape timeout using effective_timeout
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_queries_with_cancellation, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config, cancel_event, settings)
+            future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, max_lifetime, tz, conn_config)
             try:
                 metrics_output = future.result(timeout=effective_timeout)
             except TimeoutError:
-                cancel_event.set()  # Signal cancellation to running queries
                 logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
                 return make_text_response('up{target="unknown"} 0\nerror{message="scrape_timeout"} 1', status=504)
 
@@ -938,46 +849,3 @@ def initialize_connection_pools():
 
 # Call this at startup
 initialize_connection_pools()
-
-def graceful_shutdown():
-    """
-    Gracefully close all database connections when shutting down.
-    Called on SIGTERM (docker stop) or SIGINT (Ctrl+C).
-    """
-    logging.info("Graceful shutdown initiated - closing database connections...")
-    try:
-        # Close all connection pools
-        for data_source_name, (pool, lock) in connection_pools.items():
-            logging.info(f"Closing connection pool for '{data_source_name}'...")
-            with lock:
-                closed_count = 0
-                while not pool.empty():
-                    try:
-                        conn_wrapper = pool.get_nowait()
-                        conn_wrapper.conn.close()
-                        closed_count += 1
-                    except Exception as e:
-                        logging.warning(f"Error closing connection in pool '{data_source_name}': {e}")
-                logging.info(f"Closed {closed_count} connections for '{data_source_name}'")
-        logging.info("Graceful shutdown completed")
-    except Exception as e:
-        logging.error(f"Error during graceful shutdown: {e}")
-
-def signal_handler(signum, frame):
-    """
-    Handle shutdown signals (SIGTERM from docker stop, SIGINT from Ctrl+C).
-    """
-    signal_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT" if signum == signal.SIGINT else f"Signal {signum}"
-    logging.info(f"Received {signal_name} - initiating graceful shutdown...")
-    graceful_shutdown()
-    logging.info("Exiting...")
-    os._exit(0)
-
-# Register signal handlers for graceful shutdown
-signal.signal(signal.SIGTERM, signal_handler)  # Docker stop
-signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-logging.info("Signal handlers registered for graceful shutdown (SIGTERM, SIGINT)")
-
-# Register cleanup function to run on normal exit as well
-import atexit
-atexit.register(graceful_shutdown)
