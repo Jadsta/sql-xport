@@ -271,19 +271,6 @@ def load_queries_from_collectors(matched_collectors):
 class PooledConnection:
     def __init__(self, conn):
         self.conn = conn
-        self.created_at = time.time()
-        self.last_used_at = time.time()
-
-    def is_expired(self, max_lifetime):
-        return max_lifetime > 0 and (time.time() - self.created_at) > max_lifetime
-    
-    def is_idle_expired(self, idle_timeout):
-        """Check if connection has been idle (unused) for too long"""
-        return idle_timeout > 0 and (time.time() - self.last_used_at) > idle_timeout
-    
-    def mark_used(self):
-        """Update the last used timestamp"""
-        self.last_used_at = time.time()
         
 def connect_with_retries(conn_config):
     retries = conn_config.get('connection_retries', 1)
@@ -344,7 +331,7 @@ def is_connection_alive(conn):
         logging.warning(f"Connection health check failed: {e}")
         return False
 
-def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, idle_timeout, tz, conn_config=None):
+def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=None, effective_timeout=None):
     import datetime
     import time
     from collections import defaultdict
@@ -494,11 +481,9 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, idle
                     metric_line = f"{metric_name}{{{','.join(labels_sorted)}}} {value}{timestamp}"
                     metric_samples[metric_name].append(metric_line)
             
-            # Return connection to pool if not forced new
-            if not force_new_connection and connection_pool.qsize() < max_idle:
-                # Update last_used_at before returning to pool
-                conn_wrapper.mark_used()
-                connection_pool.put(conn_wrapper)
+            # Return connection to temp pool if not forced new connection
+            if not force_new_connection:
+                connection_pool.put(conn_wrapper)  # connection_pool is temp_pool here
             else:
                 try:
                     conn_wrapper.conn.close()
@@ -506,11 +491,25 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, idle
                     pass
             return metric_meta, metric_samples
         except Exception as e:
-            if conn_wrapper:
+            # On SQL errors (not connection errors), return connection to pool
+            # Connection errors are already handled in the retry logic above
+            if conn_wrapper and not force_new_connection:
+                try:
+                    connection_pool.put(conn_wrapper)  # Return to temp_pool
+                    logging.debug(f"Returned connection to pool after SQL error: {e}")
+                except Exception as pool_exc:
+                    logging.error(f"Failed to return connection to pool after SQL error: {pool_exc}")
+                    # If we can't return to pool, close it
+                    try:
+                        conn_wrapper.conn.close()
+                    except Exception:
+                        pass
+            elif conn_wrapper and force_new_connection:
+                # If force_new_connection, close it as intended
                 try:
                     conn_wrapper.conn.close()
-                except Exception as close_exc:
-                    logging.error(f"[ERROR] Failed to close connection after error: {close_exc}")
+                except Exception:
+                    pass
             raise e
         finally:
             # Always close cursor to prevent Teradata sessions from staying in responding state
@@ -528,7 +527,7 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, max_lifetime, idle
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_query = {executor.submit(execute_query, q): q for q in query_defs}
         try:
-            for future in as_completed(future_to_query, timeout=conn_config.get('scrape_timeout_offset', 0) or None):
+            for future in as_completed(future_to_query, timeout=effective_timeout):
                 query_def = future_to_query[future]
                 try:
                     metric_meta, metric_samples = future.result()
@@ -573,37 +572,42 @@ def get_connection_config_from_settings(data_source_name, settings_path):
 # Global connection pools per data source
 connection_pools = {}
 pool_locks = {}
+connection_counts = {}  # Track total number of connections per data source
 
 def get_or_create_pool(data_source_name, conn_config, max_pool_size):
     """
     Get or create a shared connection pool for the given data source.
     """
-    global connection_pools, pool_locks
+    global connection_pools, pool_locks, connection_counts
     if data_source_name not in connection_pools:
         connection_pools[data_source_name] = Queue(maxsize=max_pool_size)
         pool_locks[data_source_name] = Lock()
+        connection_counts[data_source_name] = 0
     return connection_pools[data_source_name], pool_locks[data_source_name]
 
-def acquire_connections(connection_pool, pool_lock, num_needed, timeout=30, conn_config=None, max_lifetime=0, idle_timeout=0):
+def acquire_connections(connection_pool, pool_lock, num_needed, pool_timeout=30, conn_config=None, pool_size=None, connection_count=None, data_source_name=None):
     """
     Acquire up to num_needed live connections from the pool, replacing dead/expired ones with new connections.
     Returns a list of connections.
     """
+    global connection_counts
     acquired = []
     attempts = 0
     while len(acquired) < num_needed and attempts < num_needed * 2:
         attempts += 1
         try:
-            conn_wrapper = connection_pool.get(block=True, timeout=timeout)
-            # Check expiration (lifetime and idle), and health
-            lifetime_expired = conn_wrapper.is_expired(max_lifetime)
-            idle_expired = conn_wrapper.is_idle_expired(idle_timeout)
+            conn_wrapper = connection_pool.get(block=True, timeout=pool_timeout)
+            # Check connection health
             alive = is_connection_alive(conn_wrapper.conn)
             
-            if lifetime_expired or idle_expired or not alive:
-                logging.info(f"Discarding pooled connection (lifetime_expired={lifetime_expired}, idle_expired={idle_expired}, alive={alive})")
+            if not alive:
+                logging.info(f"Discarding pooled connection (alive={alive})")
                 try:
                     conn_wrapper.conn.close()
+                    # Decrement connection count when closing
+                    if data_source_name and data_source_name in connection_counts:
+                        connection_counts[data_source_name] -= 1
+                        logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
                 except Exception as e:
                     logging.warning(f"Error closing dead/expired connection: {e}")
                 # Replace with new connection
@@ -611,24 +615,45 @@ def acquire_connections(connection_pool, pool_lock, num_needed, timeout=30, conn
                     try:
                         new_conn = connect_with_retries(conn_config)
                         acquired.append(PooledConnection(new_conn))
-                        logging.info("Replaced dead/expired connection with new live connection")
+                        # Increment connection count when creating (replacement)
+                        if data_source_name:
+                            connection_counts[data_source_name] += 1
+                            logging.info(f"Replaced dead connection with new live connection (total: {connection_counts[data_source_name]})")
                     except Exception as e:
-                        logging.error(f"Failed to create new connection after discarding dead/expired: {e}")
+                        logging.error(f"Failed to create new connection after discarding dead: {e}")
                 continue
-            # Mark as used when acquired from pool
-            conn_wrapper.mark_used()
+            # Connection is good, use it
             acquired.append(conn_wrapper)
         except queue.Empty:
-            break  # Timeout reached, stop waiting
-    # If not enough connections, try to create new ones
-    while len(acquired) < num_needed and conn_config:
-        try:
-            new_conn = connect_with_retries(conn_config)
-            acquired.append(PooledConnection(new_conn))
-            logging.info("Created new connection to meet required pool size")
-        except Exception as e:
-            logging.error(f"Failed to create new connection: {e}")
+            # Timeout reached waiting for pool connection
+            logging.warning(f"Timed out after {pool_timeout}s waiting for connection from pool (acquired {len(acquired)}/{num_needed})")
             break
+    
+    # If not enough connections, check if we can create new ones
+    if len(acquired) < num_needed:
+        # Check if we're at max capacity using total connection count
+        current_count = connection_counts.get(data_source_name, 0) if data_source_name else 0
+        if pool_size is not None and current_count >= pool_size:
+            # At max capacity, cannot create more connections
+            raise Exception(f"No connections available in pool within scrape timeout ({pool_timeout}s). Pool at max capacity ({pool_size}, currently {current_count} connections).")
+        
+        # Pool not at max, create new connections to fill the gap
+        while len(acquired) < num_needed and conn_config:
+            current_count = connection_counts.get(data_source_name, 0) if data_source_name else 0
+            if pool_size is not None and current_count >= pool_size:
+                logging.warning(f"Reached max connections ({pool_size}) while creating new connections")
+                break
+            try:
+                new_conn = connect_with_retries(conn_config)
+                acquired.append(PooledConnection(new_conn))
+                # Increment connection count when creating
+                if data_source_name:
+                    connection_counts[data_source_name] += 1
+                    logging.info(f"Created new connection to meet required pool size (total: {connection_counts[data_source_name]})")
+            except Exception as e:
+                logging.error(f"Failed to create new connection: {e}")
+                break
+    
     return acquired
 
 def get_timezone(global_config, conn_config):
@@ -712,16 +737,12 @@ def metrics():
         # Ensure exporter max connections is at least 1 to avoid zero-worker situations
         exporter_max_conn = max(1, global_config.get('max_connections', 1))
         max_idle = global_config.get('max_idle_connections', 1)
-        max_lifetime = parse_duration(global_config.get('max_connection_lifetime', '0'))
         scrape_timeout_offset = parse_duration(global_config.get('scrape_timeout_offset', '0'))
         # Load connection config from settings.yml using data_source_name
         data_source_name = config['target']['data_source_name']
         settings_path = Path(__file__).parent / 'settings.yml'
         conn_config = get_connection_config_from_settings(data_source_name, settings_path)
         
-        # Get idle_timeout from data source config (settings.yml)
-        idle_timeout = parse_duration(str(conn_config.get('idle_timeout', '0')))
-        logging.info(f"Using idle_timeout: {idle_timeout} seconds for data source '{data_source_name}'")
         # Get scrape_timeout from config, fallback to settings.yml, then default
         settings = load_settings(settings_path)
         settings_scrape_timeout = settings.get('scrape_timeout', 30)
@@ -776,14 +797,14 @@ def metrics():
         with pool_lock:
             num_to_acquire = min(exporter_max_conn, pool_size)
             num_to_acquire = max(1, num_to_acquire)
-            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, conn_config=conn_config, max_lifetime=max_lifetime, idle_timeout=idle_timeout)
+            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, pool_timeout=effective_timeout, conn_config=conn_config, pool_size=pool_size, data_source_name=data_source_name)
             temp_pool = Queue(maxsize=num_to_acquire)
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
         # Enforce scrape timeout using effective_timeout
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, max_lifetime, idle_timeout, tz, conn_config)
+            future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout)
             try:
                 metrics_output = future.result(timeout=effective_timeout)
             except TimeoutError:
@@ -795,14 +816,44 @@ def metrics():
                         leaked_conn = temp_pool.get()
                         try:
                             leaked_conn.conn.close()
-                            logging.warning(f"Closed leaked connection due to scrape timeout")
+                            # Decrement connection count
+                            if data_source_name in connection_counts:
+                                connection_counts[data_source_name] -= 1
+                                logging.warning(f"Closed leaked connection due to scrape timeout (count: {connection_counts[data_source_name]})")
                         except Exception as close_exc:
                             logging.error(f"Failed to close leaked connection: {close_exc}")
                 return make_text_response('up{target="unknown"} 0\nerror{message="scrape_timeout"} 1', status=504)
 
+        # Return connections from temp_pool back to main pool
         with pool_lock:
             while not temp_pool.empty():
-                connection_pool.put(temp_pool.get())
+                conn_wrapper = temp_pool.get()
+                # Check if main pool has space (respecting max_idle)
+                if connection_pool.qsize() < max_idle:
+                    try:
+                        connection_pool.put_nowait(conn_wrapper)
+                    except queue.Full:
+                        # Pool is full, close this connection
+                        logging.info(f"Main pool full (size={connection_pool.qsize()}), closing connection instead of returning")
+                        try:
+                            conn_wrapper.conn.close()
+                            # Decrement connection count
+                            if data_source_name in connection_counts:
+                                connection_counts[data_source_name] -= 1
+                                logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
+                        except Exception as e:
+                            logging.error(f"Failed to close connection: {e}")
+                else:
+                    # Pool already at max_idle, close this connection
+                    logging.info(f"Main pool at max_idle ({max_idle}), closing excess connection")
+                    try:
+                        conn_wrapper.conn.close()
+                        # Decrement connection count
+                        if data_source_name in connection_counts:
+                            connection_counts[data_source_name] -= 1
+                            logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
+                    except Exception as e:
+                        logging.error(f"Failed to close excess connection: {e}")
 
         duration = time.time() - start
         target_name = config['target'].get('name')
@@ -824,13 +875,16 @@ def metrics():
         logging.error(f"Error during scrape: {str(e)}")
         # Clean up any connections that may be in temp_pool if it was created
         try:
-            if 'temp_pool' in locals():
+            if 'temp_pool' in locals() and 'data_source_name' in locals():
                 with pool_lock:
                     while not temp_pool.empty():
                         leaked_conn = temp_pool.get()
                         try:
                             leaked_conn.conn.close()
-                            logging.warning(f"Closed leaked connection due to exception during scrape")
+                            # Decrement connection count
+                            if data_source_name in connection_counts:
+                                connection_counts[data_source_name] -= 1
+                                logging.warning(f"Closed leaked connection due to exception during scrape (count: {connection_counts[data_source_name]})")
                         except Exception as close_exc:
                             logging.error(f"Failed to close leaked connection: {close_exc}")
         except Exception as cleanup_exc:
@@ -885,7 +939,9 @@ def initialize_connection_pools():
                     try:
                         conn = connect_with_retries(conn_config)
                         connection_pool.put(PooledConnection(conn))
-                        logging.info(f"Pre-populated connection for data source '{data_source_name}'")
+                        # Increment connection count
+                        connection_counts[data_source_name] += 1
+                        logging.info(f"Pre-populated connection for data source '{data_source_name}' (total: {connection_counts[data_source_name]})")
                     except Exception as e:
                         tb = traceback.format_exc()
                         logging.error(f"Failed to pre-populate connection for '{data_source_name}': {e}\n{tb}")
