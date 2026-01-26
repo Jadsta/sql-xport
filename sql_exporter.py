@@ -375,19 +375,17 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
             else:
                 if not connection_pool.empty():
                     candidate = connection_pool.get()
-                    # Check if connection is expired by lifetime, idle timeout, or dead
-                    if candidate.is_expired(max_lifetime) or candidate.is_idle_expired(idle_timeout) or not is_connection_alive(candidate.conn):
+                    # Check if connection is alive
+                    if not is_connection_alive(candidate.conn):
                         try:
                             candidate.conn.close()
-                            logging.info(f"Closed connection: lifetime_expired={candidate.is_expired(max_lifetime)}, idle_expired={candidate.is_idle_expired(idle_timeout)}, alive={is_connection_alive(candidate.conn)}")
+                            logging.info(f"Closed dead connection (alive=False)")
                         except Exception:
                             pass
                         conn = connect_with_retries(conn_config or {})
                         conn_wrapper = PooledConnection(conn)
                     else:
                         conn_wrapper = candidate
-                        # Mark connection as used
-                        conn_wrapper.mark_used()
                 else:
                     conn = connect_with_retries(conn_config or {})
                     conn_wrapper = PooledConnection(conn)
