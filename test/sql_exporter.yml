@@ -1,8 +1,8 @@
 global:
   scrape_timeout_offset: 500ms
+  scrape_timeout: 10m
   max_connections: 2
   max_idle_connections: 1
-  max_connection_lifetime: 5m
   # Optional: override timezone for this exporter
   timezone: "America/New_York"
 
