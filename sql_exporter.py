@@ -13,6 +13,7 @@ from collections import defaultdict
 import queue
 import pytz
 import os
+import sys                      # For stderr output in logging handler
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import traceback                # For detailed error logging
 try:
@@ -47,6 +48,53 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+# Optional: Add separate error log file if configured in settings.yml
+try:
+    if _settings_path.exists():
+        _error_log_file = (_settings.get('global') or {}).get('error_log_file')
+        if _error_log_file:
+            _error_handler = logging.FileHandler(_error_log_file)
+            _error_handler.setLevel(logging.ERROR)
+            _error_handler.setFormatter(logging.Formatter(
+                '[%(asctime)s] %(levelname)s: %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
+            logging.getLogger().addHandler(_error_handler)
+            logging.getLogger().info(f"Error logging to file: {_error_log_file}")
+except Exception as e:
+    # If error log setup fails, continue without it
+    pass
+
+# Optional: Add Teradata database logging if configured in settings.yml
+try:
+    if _settings_path.exists():
+        _db_logging = (_settings.get('global') or {}).get('database_logging')
+        if _db_logging and _db_logging.get('enabled'):
+            _db_log_config = _db_logging.get('connection', {})
+            _db_log_table = _db_logging.get('table_name')
+            _db_log_username = _db_logging.get('username', 'sql_exporter')
+            _db_log_batch = _db_logging.get('batch_size', 10)
+            _db_log_interval = _db_logging.get('flush_interval', 5)
+            _db_log_level = _db_logging.get('log_level', 'INFO')
+            
+            if _db_log_config and _db_log_table:
+                _td_handler = TeradataLogHandler(
+                    db_config=_db_log_config,
+                    table_name=_db_log_table,
+                    username=_db_log_username,
+                    batch_size=_db_log_batch,
+                    flush_interval=_db_log_interval
+                )
+                _td_handler.setLevel(getattr(logging, _db_log_level.upper(), logging.INFO))
+                _td_handler.setFormatter(logging.Formatter('%(message)s'))  # Just the message, metadata in columns
+                logging.getLogger().addHandler(_td_handler)
+                logging.getLogger().info(f"Database logging enabled to {_db_log_table} (level: {_db_log_level})")
+except Exception as e:
+    # If database logging setup fails, continue without it
+    print(f"Failed to initialize database logging: {e}", file=sys.stderr)
+    pass
+
 logging.getLogger().info(f"Logging initialized at level: {logging.getLevelName(_level)} (from settings.yml)")
 
 
@@ -73,6 +121,106 @@ class TZFormatter(logging.Formatter):
             return dt.strftime(datefmt)
         # Default ISO
         return dt.isoformat()
+
+
+class TeradataLogHandler(logging.Handler):
+    """Custom logging handler that writes logs to a Teradata database table."""
+    
+    def __init__(self, db_config, table_name, username='sql_exporter', batch_size=10, flush_interval=5):
+        super().__init__()
+        self.db_config = db_config
+        self.table_name = table_name
+        self.username = username
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.buffer = []
+        self.last_flush = time.time()
+        self.conn = None
+        self._connect()
+    
+    def _connect(self):
+        """Establish connection to Teradata for logging."""
+        try:
+            dsn = {
+                "host": self.db_config["host"],
+                "user": self.db_config["user"],
+                "password": self.db_config.get("password")
+            }
+            for key in ["logmech", "connect_timeout"]:
+                if key in self.db_config:
+                    dsn[key] = self.db_config[key]
+            self.conn = teradatasql.connect(**dsn)
+        except Exception as e:
+            # Don't crash if database logging connection fails
+            print(f"Failed to connect to Teradata for logging: {e}", file=sys.stderr)
+            self.conn = None
+    
+    def emit(self, record):
+        """Buffer log record and flush to database when batch is full."""
+        try:
+            # Create timestamp components
+            dt = datetime.datetime.fromtimestamp(record.created)
+            create_date = dt.strftime('%Y-%m-%d')
+            create_time = dt.strftime('%H:%M:%S')
+            create_ts = dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # milliseconds
+            
+            # Format the log message
+            event_text = self.format(record)
+            event_type = record.levelname
+            
+            self.buffer.append((create_date, create_time, create_ts, self.username, event_type, event_text))
+            
+            # Flush if buffer is full or flush interval exceeded
+            if len(self.buffer) >= self.batch_size or (time.time() - self.last_flush) >= self.flush_interval:
+                self.flush()
+        except Exception:
+            # Silently fail to prevent logging errors from breaking the application
+            pass
+    
+    def flush(self):
+        """Write buffered log records to Teradata."""
+        if not self.buffer:
+            return
+        
+        if not self.conn:
+            self._connect()
+        
+        if not self.conn:
+            # Still no connection, clear buffer and give up
+            self.buffer = []
+            return
+        
+        try:
+            cursor = self.conn.cursor()
+            # Build multi-row insert
+            sql = f"""INSERT INTO {self.table_name} 
+                (CreateDate, CreateTime, CreateTS, UserName, EventType, EventText)
+                VALUES (?, ?, ?, ?, ?, ?)"""
+            
+            cursor.executemany(sql, self.buffer)
+            self.conn.commit()
+            cursor.close()
+            self.buffer = []
+            self.last_flush = time.time()
+        except Exception as e:
+            # If insert fails, try to reconnect for next batch
+            print(f"Failed to write logs to Teradata: {e}", file=sys.stderr)
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            self.buffer = []  # Clear buffer to prevent memory buildup
+    
+    def close(self):
+        """Flush remaining logs and close connection."""
+        self.flush()
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        super().close()
 
 
 def apply_logging_timezone(tzinfo):
@@ -187,9 +335,9 @@ def resolve_collectors(config, base_dir):
 
     matched_names = [name for name, _ in matched_collectors]
     available_names = [name for name, _ in available_collectors]
-    logging.info(f"Matched collectors: {matched_names}")
-    # Log available collector names at INFO so it's visible in standard logs
-    logging.info(f"Available collectors: {available_names}")
+    logging.debug(f"Matched collectors: {matched_names}")
+    # Log available collector names at DEBUG to reduce log verbosity
+    logging.debug(f"Available collectors: {available_names}")
     return matched_collectors, available_collectors
 
 def resolve_queries_from_metrics(collector):
@@ -368,10 +516,26 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
     def execute_query(query_def):
         conn_wrapper = None
         cursor = None
+        # Get data_source_name from conn_config for connection count tracking
+        data_source_name = None
+        if conn_config:
+            # Try to find data_source_name from settings by matching conn_config
+            try:
+                settings = load_settings(Path(__file__).parent / 'settings.yml')
+                for ds_name, ds_config in settings.get('data_sources', {}).items():
+                    if ds_config.get('host') == conn_config.get('host') and ds_config.get('user') == conn_config.get('user'):
+                        data_source_name = ds_name
+                        break
+            except Exception:
+                pass
         try:
             if force_new_connection:
                 conn = connect_with_retries(conn_config or {})
                 conn_wrapper = PooledConnection(conn)
+                # Increment count for new connection
+                if data_source_name and data_source_name in connection_counts:
+                    connection_counts[data_source_name] += 1
+                    logging.debug(f"Created new connection (force_new_connection=True), count: {connection_counts[data_source_name]}")
             else:
                 if not connection_pool.empty():
                     candidate = connection_pool.get()
@@ -379,16 +543,28 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
                     if not is_connection_alive(candidate.conn):
                         try:
                             candidate.conn.close()
-                            logging.info(f"Closed dead connection (alive=False)")
+                            # Decrement count for closed dead connection (it was counted when acquired)
+                            if data_source_name and data_source_name in connection_counts:
+                                connection_counts[data_source_name] -= 1
+                                logging.info(f"Closed dead connection (alive=False), count: {connection_counts[data_source_name]}")
                         except Exception:
                             pass
                         conn = connect_with_retries(conn_config or {})
                         conn_wrapper = PooledConnection(conn)
+                        # Increment count for replacement connection
+                        if data_source_name and data_source_name in connection_counts:
+                            connection_counts[data_source_name] += 1
+                            logging.debug(f"Created replacement connection, count: {connection_counts[data_source_name]}")
                     else:
                         conn_wrapper = candidate
                 else:
+                    # temp_pool is empty, create new connection
                     conn = connect_with_retries(conn_config or {})
                     conn_wrapper = PooledConnection(conn)
+                    # Increment count for new connection
+                    if data_source_name and data_source_name in connection_counts:
+                        connection_counts[data_source_name] += 1
+                        logging.debug(f"Created new connection (temp_pool empty), count: {connection_counts[data_source_name]}")
 
             sql = query_def['sql']
             metrics = query_def['metrics']
@@ -417,6 +593,8 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
                     if 'lost connection' in str(e).lower() or 'connection reset' in str(e).lower() or 'session reset' in str(e).lower():
                         try:
                             conn_wrapper.conn.close()
+                            # Note: We don't decrement here because we're replacing with a new connection
+                            # The count stays the same (close old, create new = net zero)
                         except Exception:
                             pass
                         conn = connect_with_retries(conn_config or {})
@@ -485,6 +663,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
             else:
                 try:
                     conn_wrapper.conn.close()
+                    # Decrement connection count when force_new_connection is used
+                    if data_source_name and data_source_name in connection_counts:
+                        connection_counts[data_source_name] -= 1
+                        logging.debug(f"Decremented connection count after force_new_connection close (count: {connection_counts[data_source_name]})")
                 except Exception:
                     pass
             return metric_meta, metric_samples
@@ -500,12 +682,20 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
                     # If we can't return to pool, close it
                     try:
                         conn_wrapper.conn.close()
+                        # Decrement connection count
+                        if data_source_name and data_source_name in connection_counts:
+                            connection_counts[data_source_name] -= 1
+                            logging.debug(f"Decremented connection count after failed pool return (count: {connection_counts[data_source_name]})")
                     except Exception:
                         pass
             elif conn_wrapper and force_new_connection:
                 # If force_new_connection, close it as intended
                 try:
                     conn_wrapper.conn.close()
+                    # Decrement connection count
+                    if data_source_name and data_source_name in connection_counts:
+                        connection_counts[data_source_name] -= 1
+                        logging.debug(f"Decremented connection count after closing in exception handler (count: {connection_counts[data_source_name]})")
                 except Exception:
                     pass
             raise e
@@ -684,10 +874,10 @@ def make_text_response(body_text, status=200):
     # don't cache the wrong representation.
     vary_header = 'Accept-Encoding'
     if 'gzip' in accept_enc.lower():
-        logging.info("Client supports gzip; attempting to compress response")
+        logging.debug("Client supports gzip; attempting to compress response")
         try:
             compressed = gzip.compress(body_bytes)
-            logging.info(f"Compressed response: {len(body_bytes)} -> {len(compressed)} bytes")
+            logging.debug(f"Compressed response: {len(body_bytes)} -> {len(compressed)} bytes")
             resp = Response(compressed, status=status)
             resp.headers['Content-Encoding'] = 'gzip'
             resp.headers['Content-Type'] = content_type

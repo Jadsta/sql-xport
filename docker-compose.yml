@@ -12,6 +12,7 @@ services:
       - ./settings.yml:/home/tdmon/app/settings.yml
       - ./gunicorn_config.py:/home/tdmon/app/gunicorn_config.py
       - ./certs:/certs:ro
+      - ./logs:/home/tdmon/app/logs  # Mount logs directory for error log file
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped

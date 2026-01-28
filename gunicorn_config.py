@@ -4,7 +4,11 @@ threads = 1  # !!!KEEP THIS AS 1 for blocking operations
 worker_class = "gthread"  # Use 'sync' for pure blocking, 'gthread' for lightweight concurrency
 
 loglevel = "info"
-accesslog = "-"  # Log to stdout
+
+# Disable HTTP access logs - application already logs scrape operations
+# This prevents duplicate/inconsistent log formats
+accesslog = None
+
 errorlog = "-"   # Log to stderr
 
 timeout = 60      # Worker timeout in seconds
