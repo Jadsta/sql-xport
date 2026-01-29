@@ -78,13 +78,14 @@ class TZFormatter(logging.Formatter):
 class TeradataLogHandler(logging.Handler):
     """Custom logging handler that writes logs to a Teradata database table."""
     
-    def __init__(self, db_config, table_name, username='sql_exporter', batch_size=10, flush_interval=5):
+    def __init__(self, db_config, table_name, username='sql_exporter', batch_size=10, flush_interval=5, tz=None):
         super().__init__()
         self.db_config = db_config
         self.table_name = table_name
         self.username = username
         self.batch_size = batch_size
         self.flush_interval = flush_interval
+        self.tz = tz or datetime.timezone.utc  # Use provided timezone or default to UTC
         self.buffer = []
         self.last_flush = time.time()
         self.conn = None
@@ -110,14 +111,14 @@ class TeradataLogHandler(logging.Handler):
     def emit(self, record):
         """Buffer log record and flush to database when batch is full."""
         try:
-            # Create timestamp components
-            dt = datetime.datetime.fromtimestamp(record.created)
+            # Create timestamp components using configured timezone
+            dt = datetime.datetime.fromtimestamp(record.created, tz=self.tz)
             create_date = dt.strftime('%Y-%m-%d')
             create_time = dt.strftime('%H:%M:%S')
             create_ts = dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # milliseconds
             
-            # Format the log message
-            event_text = self.format(record)
+            # Use only the message, not the formatted log entry
+            event_text = record.getMessage()
             event_type = record.levelname
             
             self.buffer.append((create_date, create_time, create_ts, self.username, event_type, event_text))
@@ -204,18 +205,32 @@ try:
             _db_log_interval = _db_logging.get('flush_interval', 5)
             _db_log_level = _db_logging.get('log_level', 'INFO')
             
+            # Get timezone for database logging timestamps
+            _tz_name = (_settings.get('global') or {}).get('timezone', 'system')
+            _db_tz = None
+            try:
+                if _tz_name == 'system':
+                    if tzlocal:
+                        _db_tz = tzlocal.get_localzone()
+                    else:
+                        _db_tz = datetime.timezone.utc
+                else:
+                    _db_tz = pytz.timezone(_tz_name)
+            except Exception:
+                _db_tz = datetime.timezone.utc
+            
             if _db_log_config and _db_log_table:
                 _td_handler = TeradataLogHandler(
                     db_config=_db_log_config,
                     table_name=_db_log_table,
                     username=_db_log_username,
                     batch_size=_db_log_batch,
-                    flush_interval=_db_log_interval
+                    flush_interval=_db_log_interval,
+                    tz=_db_tz
                 )
                 _td_handler.setLevel(getattr(logging, _db_log_level.upper(), logging.INFO))
-                _td_handler.setFormatter(logging.Formatter('%(message)s'))  # Just the message, metadata in columns
                 logging.getLogger().addHandler(_td_handler)
-                logging.getLogger().info(f"Database logging enabled to {_db_log_table} (level: {_db_log_level})")
+                logging.getLogger().info(f"Database logging enabled to {_db_log_table} (level: {_db_log_level}, tz: {_tz_name})")
 except Exception as e:
     # If database logging setup fails, continue without it
     print(f"Failed to initialize database logging: {e}", file=sys.stderr)
