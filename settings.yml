@@ -8,13 +8,12 @@ global:
   database_logging:
     enabled: false  # Set to true to enable logging to Teradata database
     table_name: "LOGDB.ApplicationLogs"  # Format: DATABASE.TABLE
-    username: "sql_exporter"  # Username to record in logs
     log_level: "INFO"  # Minimum level to log to database (DEBUG, INFO, WARNING, ERROR)
     batch_size: 10  # Number of log records to buffer before inserting
     flush_interval: 5  # Seconds between flushes (whichever comes first: batch_size or interval)
     connection:
       host: "your-teradata-host"
-      user: "log-user"
+      user: "log-user"  # This user will be recorded in the UserName column
       password: "log-password"
       logmech: "TD2"
       connect_timeout: 10

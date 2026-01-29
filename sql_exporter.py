@@ -200,7 +200,8 @@ try:
         if _db_logging and _db_logging.get('enabled'):
             _db_log_config = _db_logging.get('connection', {})
             _db_log_table = _db_logging.get('table_name')
-            _db_log_username = _db_logging.get('username', 'sql_exporter')
+            # Use the database connection username as the logger username
+            _db_log_username = _db_log_config.get('user', 'sql_exporter')
             _db_log_batch = _db_logging.get('batch_size', 10)
             _db_log_interval = _db_logging.get('flush_interval', 5)
             _db_log_level = _db_logging.get('log_level', 'INFO')
