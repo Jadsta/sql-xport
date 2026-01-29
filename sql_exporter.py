@@ -1033,21 +1033,12 @@ def metrics():
             try:
                 metrics_output = future.result(timeout=effective_timeout)
             except TimeoutError:
-                logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds")
-                # CRITICAL: Clean up connections from temp_pool before returning
-                # These connections were acquired but the scrape timed out
-                with pool_lock:
-                    while not temp_pool.empty():
-                        leaked_conn = temp_pool.get()
-                        try:
-                            leaked_conn.conn.close()
-                            # Decrement connection count
-                            if data_source_name in connection_counts:
-                                connection_counts[data_source_name] -= 1
-                                logging.warning(f"Closed leaked connection due to scrape timeout (count: {connection_counts[data_source_name]})")
-                        except Exception as close_exc:
-                            logging.error(f"Failed to close leaked connection: {close_exc}")
-                return make_text_response('up{target="unknown"} 0\nerror{message="scrape_timeout"} 1', status=504)
+                target_name = config['target'].get('name', 'unknown')
+                logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds for exporter='{exporter}', target='{target_name}'")
+                # DON'T clean up temp_pool here - worker threads are still using those connections
+                # Let them finish and return connections naturally to avoid count mismatch
+                # The run_queries function will handle partial results
+                return make_text_response(f'up{{target="{target_name}",exporter="{exporter}"}} 0\nerror{{target="{target_name}",exporter="{exporter}",message="scrape_timeout"}} 1', status=504)
 
         # Return connections from temp_pool back to main pool
         with pool_lock:
@@ -1098,22 +1089,8 @@ def metrics():
 
     except Exception as e:
         logging.error(f"Error during scrape: {str(e)}")
-        # Clean up any connections that may be in temp_pool if it was created
-        try:
-            if 'temp_pool' in locals() and 'data_source_name' in locals():
-                with pool_lock:
-                    while not temp_pool.empty():
-                        leaked_conn = temp_pool.get()
-                        try:
-                            leaked_conn.conn.close()
-                            # Decrement connection count
-                            if data_source_name in connection_counts:
-                                connection_counts[data_source_name] -= 1
-                                logging.warning(f"Closed leaked connection due to exception during scrape (count: {connection_counts[data_source_name]})")
-                        except Exception as close_exc:
-                            logging.error(f"Failed to close leaked connection: {close_exc}")
-        except Exception as cleanup_exc:
-            logging.error(f"Error during connection cleanup in exception handler: {cleanup_exc}")
+        # Note: Don't clean up temp_pool here either - let workers finish naturally
+        # Worker threads may still be using connections from temp_pool
         return make_text_response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', status=500)
 
 # --- Pre-populate connection pools at startup ---
