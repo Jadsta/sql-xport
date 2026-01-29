@@ -948,6 +948,28 @@ def metrics():
         settings_path = Path(__file__).parent / 'settings.yml'
         conn_config = get_connection_config_from_settings(data_source_name, settings_path)
         
+        # Log pool state before scrape
+        pool_size = max(1, conn_config.get('max_connections', 1))
+        connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
+        with pool_lock:
+            pool_actual = connection_pool.qsize()
+            count_tracked = connection_counts.get(data_source_name, 0)
+            logging.info(f"Pool state for '{data_source_name}': tracked={count_tracked}, in_pool={pool_actual}, max={pool_size}")
+            # If count is higher than pool size, reset it
+            if count_tracked > pool_size:
+                logging.warning(f"Connection count ({count_tracked}) exceeds pool size ({pool_size}), resetting to pool size")
+                connection_counts[data_source_name] = pool_actual
+
+        # ✅ Extract global settings
+        global_config = config.get('global', {})
+        # Ensure exporter max connections is at least 1 to avoid zero-worker situations
+        exporter_max_conn = max(1, global_config.get('max_connections', 1))
+        max_idle = global_config.get('max_idle_connections', 1)
+        scrape_timeout_offset = parse_duration(global_config.get('scrape_timeout_offset', '0'))
+        # Load connection config from settings.yml using data_source_name
+        data_source_name = config['target']['data_source_name']
+        settings_path = Path(__file__).parent / 'settings.yml'
+        conn_config = get_connection_config_from_settings(data_source_name, settings_path)
         # Get scrape_timeout from config, fallback to settings.yml, then default
         settings = load_settings(settings_path)
         settings_scrape_timeout = settings.get('scrape_timeout', 30)
@@ -970,8 +992,6 @@ def metrics():
         dsn = build_dsn(conn_config)
         # Ensure pool size is at least 1
         pool_size = max(1, conn_config.get('max_connections', 1))
-
-        connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
 
         matched_collectors, available_collectors = resolve_collectors(config, base_dir)
         # Validate that requested collectors actually exist
