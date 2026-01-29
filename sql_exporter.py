@@ -49,54 +49,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# Optional: Add separate error log file if configured in settings.yml
-try:
-    if _settings_path.exists():
-        _error_log_file = (_settings.get('global') or {}).get('error_log_file')
-        if _error_log_file:
-            _error_handler = logging.FileHandler(_error_log_file)
-            _error_handler.setLevel(logging.ERROR)
-            _error_handler.setFormatter(logging.Formatter(
-                '[%(asctime)s] %(levelname)s: %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
-            ))
-            logging.getLogger().addHandler(_error_handler)
-            logging.getLogger().info(f"Error logging to file: {_error_log_file}")
-except Exception as e:
-    # If error log setup fails, continue without it
-    pass
-
-# Optional: Add Teradata database logging if configured in settings.yml
-try:
-    if _settings_path.exists():
-        _db_logging = (_settings.get('global') or {}).get('database_logging')
-        if _db_logging and _db_logging.get('enabled'):
-            _db_log_config = _db_logging.get('connection', {})
-            _db_log_table = _db_logging.get('table_name')
-            _db_log_username = _db_logging.get('username', 'sql_exporter')
-            _db_log_batch = _db_logging.get('batch_size', 10)
-            _db_log_interval = _db_logging.get('flush_interval', 5)
-            _db_log_level = _db_logging.get('log_level', 'INFO')
-            
-            if _db_log_config and _db_log_table:
-                _td_handler = TeradataLogHandler(
-                    db_config=_db_log_config,
-                    table_name=_db_log_table,
-                    username=_db_log_username,
-                    batch_size=_db_log_batch,
-                    flush_interval=_db_log_interval
-                )
-                _td_handler.setLevel(getattr(logging, _db_log_level.upper(), logging.INFO))
-                _td_handler.setFormatter(logging.Formatter('%(message)s'))  # Just the message, metadata in columns
-                logging.getLogger().addHandler(_td_handler)
-                logging.getLogger().info(f"Database logging enabled to {_db_log_table} (level: {_db_log_level})")
-except Exception as e:
-    # If database logging setup fails, continue without it
-    print(f"Failed to initialize database logging: {e}", file=sys.stderr)
-    pass
-
-logging.getLogger().info(f"Logging initialized at level: {logging.getLevelName(_level)} (from settings.yml)")
-
 
 class TZFormatter(logging.Formatter):
     """Logging formatter that renders times in a given tzinfo (pytz).
@@ -221,6 +173,55 @@ class TeradataLogHandler(logging.Handler):
             except Exception:
                 pass
         super().close()
+
+
+# Optional: Add separate error log file if configured in settings.yml
+try:
+    if _settings_path.exists():
+        _error_log_file = (_settings.get('global') or {}).get('error_log_file')
+        if _error_log_file:
+            _error_handler = logging.FileHandler(_error_log_file)
+            _error_handler.setLevel(logging.ERROR)
+            _error_handler.setFormatter(logging.Formatter(
+                '[%(asctime)s] %(levelname)s: %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
+            logging.getLogger().addHandler(_error_handler)
+            logging.getLogger().info(f"Error logging to file: {_error_log_file}")
+except Exception as e:
+    # If error log setup fails, continue without it
+    pass
+
+# Optional: Add Teradata database logging if configured in settings.yml
+try:
+    if _settings_path.exists():
+        _db_logging = (_settings.get('global') or {}).get('database_logging')
+        if _db_logging and _db_logging.get('enabled'):
+            _db_log_config = _db_logging.get('connection', {})
+            _db_log_table = _db_logging.get('table_name')
+            _db_log_username = _db_logging.get('username', 'sql_exporter')
+            _db_log_batch = _db_logging.get('batch_size', 10)
+            _db_log_interval = _db_logging.get('flush_interval', 5)
+            _db_log_level = _db_logging.get('log_level', 'INFO')
+            
+            if _db_log_config and _db_log_table:
+                _td_handler = TeradataLogHandler(
+                    db_config=_db_log_config,
+                    table_name=_db_log_table,
+                    username=_db_log_username,
+                    batch_size=_db_log_batch,
+                    flush_interval=_db_log_interval
+                )
+                _td_handler.setLevel(getattr(logging, _db_log_level.upper(), logging.INFO))
+                _td_handler.setFormatter(logging.Formatter('%(message)s'))  # Just the message, metadata in columns
+                logging.getLogger().addHandler(_td_handler)
+                logging.getLogger().info(f"Database logging enabled to {_db_log_table} (level: {_db_log_level})")
+except Exception as e:
+    # If database logging setup fails, continue without it
+    print(f"Failed to initialize database logging: {e}", file=sys.stderr)
+    pass
+
+logging.getLogger().info(f"Logging initialized at level: {logging.getLevelName(_level)} (from settings.yml)")
 
 
 def apply_logging_timezone(tzinfo):
