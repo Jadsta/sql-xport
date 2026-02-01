@@ -1033,13 +1033,15 @@ def metrics():
         timeout_occurred = False
         try:
             # Enforce scrape timeout using effective_timeout
+            # Give run_queries 2 extra seconds beyond effective_timeout to return partial results
+            outer_timeout = effective_timeout + 2
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout)
                 try:
-                    metrics_output = future.result(timeout=effective_timeout)
+                    metrics_output = future.result(timeout=outer_timeout)
                 except TimeoutError:
                     target_name = config['target'].get('name', 'unknown')
-                    logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds for exporter='{exporter}', target='{target_name}'")
+                    logging.error(f"Scrape exceeded outer timeout of {outer_timeout} seconds for exporter='{exporter}', target='{target_name}' (effective timeout: {effective_timeout}s)")
                     # Note: Don't return here - let finally block return connections to pool
                     # Worker threads may still be using connections, but we need to ensure cleanup
                     metrics_output = [f'up{{target="{target_name}",exporter="{exporter}"}} 0', f'error{{target="{target_name}",exporter="{exporter}",message="scrape_timeout"}} 1']
