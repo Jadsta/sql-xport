@@ -1030,22 +1030,13 @@ def metrics():
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
-        timeout_occurred = False
         try:
-            # Enforce scrape timeout using effective_timeout
-            # Give run_queries 2 extra seconds beyond effective_timeout to return partial results
-            outer_timeout = effective_timeout + 2
+            # Let run_queries handle its own timeout internally
+            # Don't add an outer timeout that would discard partial results
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout)
-                try:
-                    metrics_output = future.result(timeout=outer_timeout)
-                except TimeoutError:
-                    target_name = config['target'].get('name', 'unknown')
-                    logging.error(f"Scrape exceeded outer timeout of {outer_timeout} seconds for exporter='{exporter}', target='{target_name}' (effective timeout: {effective_timeout}s)")
-                    # Note: Don't return here - let finally block return connections to pool
-                    # Worker threads may still be using connections, but we need to ensure cleanup
-                    metrics_output = [f'up{{target="{target_name}",exporter="{exporter}"}} 0', f'error{{target="{target_name}",exporter="{exporter}",message="scrape_timeout"}} 1']
-                    timeout_occurred = True
+                # Wait indefinitely for run_queries to return (it handles timeout internally)
+                metrics_output = future.result()
         finally:
             # CRITICAL: Always return connections from temp_pool back to main pool
             # This runs even on timeout/error to prevent connection leaks
@@ -1082,10 +1073,6 @@ def metrics():
                             logging.error(f"Failed to close excess connection: {e}")
                 if returned_count > 0:
                     logging.debug(f"Returned {returned_count} connections to main pool from temp_pool")
-
-        # If timeout occurred, return early with error response
-        if 'timeout_occurred' in locals() and timeout_occurred:
-            return make_text_response("\n".join(metrics_output), status=504)
 
         duration = time.time() - start
         target_name = config['target'].get('name')
