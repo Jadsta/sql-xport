@@ -729,11 +729,13 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
     all_metric_meta = {}
     all_metric_samples = defaultdict(list)
     errors = {}
+    completed_futures = set()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_query = {executor.submit(execute_query, q): q for q in query_defs}
         try:
             for future in as_completed(future_to_query, timeout=effective_timeout):
                 query_def = future_to_query[future]
+                completed_futures.add(future)
                 try:
                     metric_meta, metric_samples = future.result()
                     for mname, meta in metric_meta.items():
@@ -745,6 +747,10 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
                     errors[query_def['sql']] = str(e)
         except TimeoutError:
             logging.error("Partial scrape: scrape_timeout reached, returning partial results.")
+            # Add timeout errors for incomplete queries
+            for future, query_def in future_to_query.items():
+                if future not in completed_futures:
+                    errors[query_def['sql']] = "Query timed out"
     # Add error metrics for failed queries
     for sql in errors:
         all_metric_samples[f'up_error_{sql}'].append(f'up{{query="{sql}"}} 0')
