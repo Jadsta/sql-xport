@@ -1022,35 +1022,54 @@ def metrics():
         with pool_lock:
             num_to_acquire = min(exporter_max_conn, pool_size)
             num_to_acquire = max(1, num_to_acquire)
-            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, pool_timeout=effective_timeout, conn_config=conn_config, pool_size=pool_size, data_source_name=data_source_name)
+            # Use a short timeout for acquiring connections (5 seconds) instead of full scrape timeout
+            # This prevents blocking when connections are held by background workers from previous scrapes
+            connection_acquire_timeout = 10
+            acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, pool_timeout=connection_acquire_timeout, conn_config=conn_config, pool_size=pool_size, data_source_name=data_source_name)
             temp_pool = Queue(maxsize=num_to_acquire)
             for conn in acquired_conns:
                 temp_pool.put(conn)
 
-        # Enforce scrape timeout using effective_timeout
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout)
-            try:
-                metrics_output = future.result(timeout=effective_timeout)
-            except TimeoutError:
-                target_name = config['target'].get('name', 'unknown')
-                logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds for exporter='{exporter}', target='{target_name}'")
-                # DON'T clean up temp_pool here - worker threads are still using those connections
-                # Let them finish and return connections naturally to avoid count mismatch
-                # The run_queries function will handle partial results
-                return make_text_response(f'up{{target="{target_name}",exporter="{exporter}"}} 0\nerror{{target="{target_name}",exporter="{exporter}",message="scrape_timeout"}} 1', status=504)
-
-        # Return connections from temp_pool back to main pool
-        with pool_lock:
-            while not temp_pool.empty():
-                conn_wrapper = temp_pool.get()
-                # Check if main pool has space (respecting max_idle)
-                if connection_pool.qsize() < max_idle:
-                    try:
-                        connection_pool.put_nowait(conn_wrapper)
-                    except queue.Full:
-                        # Pool is full, close this connection
-                        logging.info(f"Main pool full (size={connection_pool.qsize()}), closing connection instead of returning")
+        timeout_occurred = False
+        try:
+            # Enforce scrape timeout using effective_timeout
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout)
+                try:
+                    metrics_output = future.result(timeout=effective_timeout)
+                except TimeoutError:
+                    target_name = config['target'].get('name', 'unknown')
+                    logging.error(f"Scrape exceeded timeout of {effective_timeout} seconds for exporter='{exporter}', target='{target_name}'")
+                    # Note: Don't return here - let finally block return connections to pool
+                    # Worker threads may still be using connections, but we need to ensure cleanup
+                    metrics_output = [f'up{{target="{target_name}",exporter="{exporter}"}} 0', f'error{{target="{target_name}",exporter="{exporter}",message="scrape_timeout"}} 1']
+                    timeout_occurred = True
+        finally:
+            # CRITICAL: Always return connections from temp_pool back to main pool
+            # This runs even on timeout/error to prevent connection leaks
+            with pool_lock:
+                returned_count = 0
+                while not temp_pool.empty():
+                    conn_wrapper = temp_pool.get()
+                    # Check if main pool has space (respecting max_idle)
+                    if connection_pool.qsize() < max_idle:
+                        try:
+                            connection_pool.put_nowait(conn_wrapper)
+                            returned_count += 1
+                        except queue.Full:
+                            # Pool is full, close this connection
+                            logging.info(f"Main pool full (size={connection_pool.qsize()}), closing connection instead of returning")
+                            try:
+                                conn_wrapper.conn.close()
+                                # Decrement connection count
+                                if data_source_name in connection_counts:
+                                    connection_counts[data_source_name] -= 1
+                                    logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
+                            except Exception as e:
+                                logging.error(f"Failed to close connection: {e}")
+                    else:
+                        # Pool already at max_idle, close this connection
+                        logging.info(f"Main pool at max_idle ({max_idle}), closing excess connection")
                         try:
                             conn_wrapper.conn.close()
                             # Decrement connection count
@@ -1058,18 +1077,13 @@ def metrics():
                                 connection_counts[data_source_name] -= 1
                                 logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
                         except Exception as e:
-                            logging.error(f"Failed to close connection: {e}")
-                else:
-                    # Pool already at max_idle, close this connection
-                    logging.info(f"Main pool at max_idle ({max_idle}), closing excess connection")
-                    try:
-                        conn_wrapper.conn.close()
-                        # Decrement connection count
-                        if data_source_name in connection_counts:
-                            connection_counts[data_source_name] -= 1
-                            logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
-                    except Exception as e:
-                        logging.error(f"Failed to close excess connection: {e}")
+                            logging.error(f"Failed to close excess connection: {e}")
+                if returned_count > 0:
+                    logging.debug(f"Returned {returned_count} connections to main pool from temp_pool")
+
+        # If timeout occurred, return early with error response
+        if 'timeout_occurred' in locals() and timeout_occurred:
+            return make_text_response("\n".join(metrics_output), status=504)
 
         duration = time.time() - start
         target_name = config['target'].get('name')
