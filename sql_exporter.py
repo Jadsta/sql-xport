@@ -370,6 +370,7 @@ def resolve_queries_from_metrics(collector):
         resolved.append({
             'sql': query_text,
             'metric_name': metric['metric_name'],
+            'query_ref': metric.get('query_ref'),
             'labels': metric.get('key_labels', []),
             'static_labels': metric.get('static_labels', {}),
             'values': metric.get('values', []),
