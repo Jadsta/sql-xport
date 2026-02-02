@@ -496,11 +496,12 @@ def is_connection_alive(conn):
         logging.warning(f"Connection health check failed: {e}")
         return False
 
-def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=None, effective_timeout=None):
+def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=None, effective_timeout=None, exporter=None):
     import datetime
     import time
     from collections import defaultdict
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+    logging.info(f"Starting scrape for exporter '{exporter}'")
     logging.info("Acquiring DB connection(s) for parallel query execution...")
 
     # Group metrics by their SQL query
@@ -744,17 +745,20 @@ def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=No
                         all_metric_samples[mname].extend(samples)
                 except Exception as e:
                     logging.error(f"Error running query for SQL '{query_def['sql']}': {e}")
-                    errors[query_def['sql']] = str(e)
+                    errors[query_def.get('query_ref', query_def['sql'])] = str(e)
         except TimeoutError:
-            logging.error("Partial scrape: scrape_timeout reached, returning partial results.")
-            # Add timeout errors for incomplete queries
+            # Collect timed out query_refs
+            timed_out_refs = []
             for future, query_def in future_to_query.items():
                 if future not in completed_futures:
-                    errors[query_def['sql']] = "Query timed out"
+                    query_ref = query_def.get('query_ref', query_def['sql'])
+                    errors[query_ref] = "Query timed out"
+                    timed_out_refs.append(query_ref)
+            logging.error(f"Partial scrape: scrape_timeout reached for exporter '{exporter}', returning partial results. Timed out queries: {timed_out_refs}")
     # Add error metrics for failed queries
-    for sql in errors:
-        all_metric_samples[f'up_error_{sql}'].append(f'up{{query="{sql}"}} 0')
-        all_metric_samples[f'up_error_{sql}'].append(f'error{{query="{sql}",message="{errors[sql]}"}} 1')
+    for query_ref in errors:
+        all_metric_samples[f'up_error_{query_ref}'].append(f'up{{query="{query_ref}"}} 0')
+        all_metric_samples[f'up_error_{query_ref}'].append(f'error{{query="{query_ref}",message="{errors[query_ref]}"}} 1')
     # Output metrics grouped by metric_name, with samples sorted alphabetically
     sorted_output = []
     for mname in sorted(all_metric_samples.keys()):
@@ -1040,7 +1044,7 @@ def metrics():
             # Let run_queries handle its own timeout internally
             # Don't add an outer timeout that would discard partial results
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout)
+                future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout, exporter)
                 # Wait indefinitely for run_queries to return (it handles timeout internally)
                 metrics_output = future.result()
         finally:
