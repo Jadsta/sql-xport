@@ -801,6 +801,26 @@ def get_or_create_pool(data_source_name, conn_config, max_pool_size):
         connection_counts[data_source_name] = 0
     return connection_pools[data_source_name], pool_locks[data_source_name]
 
+def cleanup_dead_connections(connection_pool, pool_lock, data_source_name):
+    """
+    Proactively remove dead connections from the pool and adjust connection count.
+    This helps recover from database restarts where connections become stale.
+    Returns the number of dead connections removed.
+    """
+    global connection_counts
+    dead_count = 0
+    temp_live_conns = []
+    
+    with pool_lock:
+        # Check all connections currently in the pool
+        while not connection_pool.empty():
+            try:
+                conn_wrapper = connection_pool.get_nowait()
+                if is_connection_alive(conn_wrapper.conn):
+                    temp_live_conns.append(conn_wrapper)
+                else:
+                    logging.info(f\"Cleaning up dead connection from pool for '{data_source_name}'\")\n                    try:\n                        conn_wrapper.conn.close()\n                        dead_count += 1\n                        if data_source_name in connection_counts:\n                            connection_counts[data_source_name] -= 1\n                    except Exception as e:\n                        logging.error(f\"Error closing dead connection during cleanup: {e}\")\n            except queue.Empty:\n                break\n        \n        # Put live connections back\n        for conn in temp_live_conns:\n            try:\n                connection_pool.put_nowait(conn)\n            except queue.Full:\n                # Shouldn't happen, but close if it does\n                try:\n                    conn.conn.close()\n                    if data_source_name in connection_counts:\n                        connection_counts[data_source_name] -= 1\n                except Exception:\n                    pass\n    \n    if dead_count > 0:\n        logging.info(f\"Cleaned up {dead_count} dead connections from pool '{data_source_name}'\")\n    \n    return dead_count
+
 def acquire_connections(connection_pool, pool_lock, num_needed, pool_timeout=30, conn_config=None, pool_size=None, connection_count=None, data_source_name=None):
     """
     Acquire up to num_needed live connections from the pool, replacing dead/expired ones with new connections.
@@ -959,17 +979,30 @@ def metrics():
         settings_path = Path(__file__).parent / 'settings.yml'
         conn_config = get_connection_config_from_settings(data_source_name, settings_path)
         
-        # Log pool state before scrape
+        # Log pool state before scrape and reconcile if needed
         pool_size = max(1, conn_config.get('max_connections', 1))
         connection_pool, pool_lock = get_or_create_pool(data_source_name, conn_config, pool_size)
+        
+        # Proactively clean up any dead connections in the pool
+        # This helps recover from database restarts
+        dead_removed = cleanup_dead_connections(connection_pool, pool_lock, data_source_name)
+        
         with pool_lock:
             pool_actual = connection_pool.qsize()
             count_tracked = connection_counts.get(data_source_name, 0)
             logging.info(f"Pool state for '{data_source_name}': tracked={count_tracked}, in_pool={pool_actual}, max={pool_size}")
-            # If count is higher than pool size, reset it
-            if count_tracked > pool_size:
-                logging.warning(f"Connection count ({count_tracked}) exceeds pool size ({pool_size}), resetting to pool size")
+            
+            # CRITICAL: Detect and fix connection leaks after database restarts
+            # If tracked count is at max but pool is empty, connections are leaked (likely timed out workers)
+            if count_tracked >= pool_size and pool_actual == 0:
+                logging.warning(f"POOL LEAK DETECTED: tracked={count_tracked} at max, but in_pool={pool_actual}. Resetting to pool size to allow new connections.")
                 connection_counts[data_source_name] = pool_actual
+                count_tracked = pool_actual
+            # If count is higher than pool size, reset it
+            elif count_tracked > pool_size:
+                logging.warning(f"Connection count ({count_tracked}) exceeds pool size ({pool_size}), resetting to actual pool size ({pool_actual})")
+                connection_counts[data_source_name] = pool_actual
+                count_tracked = pool_actual
 
         # ✅ Extract global settings
         global_config = config.get('global', {})
@@ -1053,8 +1086,26 @@ def metrics():
             # This runs even on timeout/error to prevent connection leaks
             with pool_lock:
                 returned_count = 0
+                closed_count = 0
                 while not temp_pool.empty():
                     conn_wrapper = temp_pool.get()
+                    
+                    # CRITICAL: Validate connection health before returning to pool
+                    # This prevents dead connections from accumulating after DB restarts
+                    is_alive = is_connection_alive(conn_wrapper.conn)
+                    if not is_alive:
+                        logging.warning(f"Discarding dead connection from temp_pool (alive={is_alive})")
+                        try:
+                            conn_wrapper.conn.close()
+                            closed_count += 1
+                            # Decrement connection count for dead connection
+                            if data_source_name in connection_counts:
+                                connection_counts[data_source_name] -= 1
+                                logging.info(f"Closed dead connection, count for '{data_source_name}': {connection_counts[data_source_name]}")
+                        except Exception as e:
+                            logging.error(f"Failed to close dead connection: {e}")
+                        continue
+                    
                     # Check if main pool has space (respecting max_idle)
                     if connection_pool.qsize() < max_idle:
                         try:
@@ -1065,6 +1116,7 @@ def metrics():
                             logging.info(f"Main pool full (size={connection_pool.qsize()}), closing connection instead of returning")
                             try:
                                 conn_wrapper.conn.close()
+                                closed_count += 1
                                 # Decrement connection count
                                 if data_source_name in connection_counts:
                                     connection_counts[data_source_name] -= 1
@@ -1076,14 +1128,15 @@ def metrics():
                         logging.info(f"Main pool at max_idle ({max_idle}), closing excess connection")
                         try:
                             conn_wrapper.conn.close()
+                            closed_count += 1
                             # Decrement connection count
                             if data_source_name in connection_counts:
                                 connection_counts[data_source_name] -= 1
                                 logging.debug(f"Connection count for '{data_source_name}': {connection_counts[data_source_name]}")
                         except Exception as e:
                             logging.error(f"Failed to close excess connection: {e}")
-                if returned_count > 0:
-                    logging.debug(f"Returned {returned_count} connections to main pool from temp_pool")
+                if returned_count > 0 or closed_count > 0:
+                    logging.info(f"Temp pool cleanup: returned {returned_count} live connections, closed {closed_count} dead/excess connections")
 
         duration = time.time() - start
         target_name = config['target'].get('name')
