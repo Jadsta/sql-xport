@@ -819,7 +819,34 @@ def cleanup_dead_connections(connection_pool, pool_lock, data_source_name):
                 if is_connection_alive(conn_wrapper.conn):
                     temp_live_conns.append(conn_wrapper)
                 else:
-                    logging.info(f\"Cleaning up dead connection from pool for '{data_source_name}'\")\n                    try:\n                        conn_wrapper.conn.close()\n                        dead_count += 1\n                        if data_source_name in connection_counts:\n                            connection_counts[data_source_name] -= 1\n                    except Exception as e:\n                        logging.error(f\"Error closing dead connection during cleanup: {e}\")\n            except queue.Empty:\n                break\n        \n        # Put live connections back\n        for conn in temp_live_conns:\n            try:\n                connection_pool.put_nowait(conn)\n            except queue.Full:\n                # Shouldn't happen, but close if it does\n                try:\n                    conn.conn.close()\n                    if data_source_name in connection_counts:\n                        connection_counts[data_source_name] -= 1\n                except Exception:\n                    pass\n    \n    if dead_count > 0:\n        logging.info(f\"Cleaned up {dead_count} dead connections from pool '{data_source_name}'\")\n    \n    return dead_count
+                    logging.info(f"Cleaning up dead connection from pool for '{data_source_name}'")
+                    try:
+                        conn_wrapper.conn.close()
+                        dead_count += 1
+                        if data_source_name in connection_counts:
+                            connection_counts[data_source_name] -= 1
+                    except Exception as e:
+                        logging.error(f"Error closing dead connection during cleanup: {e}")
+            except queue.Empty:
+                break
+        
+        # Put live connections back
+        for conn in temp_live_conns:
+            try:
+                connection_pool.put_nowait(conn)
+            except queue.Full:
+                # Shouldn't happen, but close if it does
+                try:
+                    conn.conn.close()
+                    if data_source_name in connection_counts:
+                        connection_counts[data_source_name] -= 1
+                except Exception:
+                    pass
+    
+    if dead_count > 0:
+        logging.info(f"Cleaned up {dead_count} dead connections from pool '{data_source_name}'")
+    
+    return dead_count
 
 def acquire_connections(connection_pool, pool_lock, num_needed, pool_timeout=30, conn_config=None, pool_size=None, connection_count=None, data_source_name=None):
     """
