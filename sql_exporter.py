@@ -1,5 +1,6 @@
 import yaml                     # For loading .yml config and collector files
 import glob                     # For resolving collector file patterns
+import re                       # For sanitizing exporter name input
 import time                     # For timestamps and connection lifetime tracking
 import logging                  # For structured logging
 from pathlib import Path        # For clean file path handling
@@ -7,14 +8,14 @@ from flask import Flask, request, Response  # For HTTP metrics endpoint
 import gzip
 import teradatasql              # For connecting to Teradata
 import datetime                 # For handling datetime values and formatting
-from threading import Semaphore, Lock # For limiting concurrent connections
+from threading import Lock # For limiting concurrent connections
 from queue import Queue         # For managing idle connection pool
-from collections import defaultdict
 import queue
 import pytz
-import os
+import math
 import sys                      # For stderr output in logging handler
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import traceback                # For detailed error logging
 try:
     import tzlocal
@@ -395,7 +396,6 @@ def format_value(val):
             # Reproduce that behavior: use the absolute value of the base-10
             # exponent as the number of digits after the decimal point in
             # the exponential representation.
-            import math
             try:
                 exponent = int(math.floor(math.log10(abs(float_val))))
             except Exception:
@@ -493,10 +493,6 @@ def is_connection_alive(conn):
         return False
 
 def run_queries(dsn_dict, queries, connection_pool, max_idle, tz, conn_config=None, effective_timeout=None, exporter=None):
-    import datetime
-    import time
-    from collections import defaultdict
-    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
     logging.info(f"Starting scrape for exporter '{exporter}'")
     logging.info("Acquiring DB connection(s) for parallel query execution...")
 
@@ -918,11 +914,9 @@ def get_timezone(global_config, conn_config):
     tz_name = global_config.get('timezone') or conn_config.get('timezone') or 'system'
     if tz_name == 'system':
         # Use system local timezone
-        try:
-            import tzlocal
+        if tzlocal:
             return tzlocal.get_localzone()
-        except ImportError:
-            return datetime.timezone.utc  # fallback to UTC
+        return datetime.timezone.utc  # fallback to UTC
     else:
         return pytz.timezone(tz_name)
 
@@ -981,7 +975,6 @@ def metrics():
         logging.warning("Missing 'exporter' parameter in request")
         return make_text_response("Missing 'exporter' parameter", status=400)
     # Sanitize exporter name: only allow alphanumeric, underscore, dash
-    import re
     if not re.match(r'^[A-Za-z0-9_-]+$', exporter):
         logging.warning(f"Invalid exporter parameter: {exporter}")
         return make_text_response("Invalid 'exporter' parameter", status=400)
@@ -1063,8 +1056,6 @@ def metrics():
         # Validate that requested collectors actually exist
         requested_collectors = config['target'].get('collectors', [])
         if len(matched_collectors) == 0:
-            # If collector files exist but none matched the requested collector names,
-            # return a helpful error listing the available collector names to aid debugging.
             if available_collectors:
                 available_names = [name for name, _ in available_collectors]
                 msg = (
@@ -1088,7 +1079,7 @@ def metrics():
         with pool_lock:
             num_to_acquire = min(exporter_max_conn, pool_size)
             num_to_acquire = max(1, num_to_acquire)
-            # Use a short timeout for acquiring connections (5 seconds) instead of full scrape timeout
+            # Use a short timeout for acquiring connections instead of full scrape timeout
             # This prevents blocking when connections are held by background workers from previous scrapes
             connection_acquire_timeout = 10
             acquired_conns = acquire_connections(connection_pool, pool_lock, num_to_acquire, pool_timeout=connection_acquire_timeout, conn_config=conn_config, pool_size=pool_size, data_source_name=data_source_name)
@@ -1097,11 +1088,8 @@ def metrics():
                 temp_pool.put(conn)
 
         try:
-            # Let run_queries handle its own timeout internally
-            # Don't add an outer timeout that would discard partial results
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(run_queries, dsn, queries, temp_pool, max_idle, tz, conn_config, effective_timeout, exporter)
-                # Wait indefinitely for run_queries to return (it handles timeout internally)
                 metrics_output = future.result()
         finally:
             # CRITICAL: Always return connections from temp_pool back to main pool
@@ -1178,8 +1166,6 @@ def metrics():
 
     except Exception as e:
         logging.error(f"Error during scrape: {str(e)}")
-        # Note: Don't clean up temp_pool here either - let workers finish naturally
-        # Worker threads may still be using connections from temp_pool
         return make_text_response(f'up{{target="unknown"}} 0\nerror{{message="{str(e)}"}} 1', status=500)
 
 # --- Pre-populate connection pools at startup ---
