@@ -30,8 +30,7 @@ try:
     _settings_path = Path(__file__).parent / 'settings.yml'
     if _settings_path.exists():
         try:
-            import yaml as _yaml
-            _settings = _yaml.safe_load(_settings_path.read_text()) or {}
+            _settings = yaml.safe_load(_settings_path.read_text()) or {}
             _gl = (_settings.get('global') or {})
             _lvl = _gl.get('log_level') or _gl.get('logging_level')
             if _lvl:
@@ -282,10 +281,6 @@ def load_sql_exporter_config(exporter_name):
     Loads the sql_exporter.yml file for the given exporter name from targets/<exporter>/sql_exporter.yml.
     Returns the parsed config dictionary and the base directory path.
     """
-    from pathlib import Path
-    import yaml
-    import logging
-
     config_path = Path(f"./targets/{exporter_name}/sql_exporter.yml")
     logging.info(f"Loading config from: {config_path}")
 
